@@ -1,13 +1,11 @@
-const std   = @import("std");
-const zql = @import("zql");
+const std     = @import("std");
+const zql     = @import("zql");
 const testing = std.testing;
 
 // ── SELECT ────────────────────────────────────────────────────────────────────
 
 test "select *" {
-    const sql = try zql.select(testing.allocator, .{
-        .table = "users",
-    });
+    const sql = try zql.select(testing.allocator, .{ .table = "users" });
     defer testing.allocator.free(sql);
     try testing.expectEqualStrings("SELECT * FROM users", sql);
 }
@@ -237,9 +235,7 @@ test "delete with where" {
 }
 
 test "delete all rows" {
-    const sql = try zql.delete(testing.allocator, .{
-        .table = "users",
-    });
+    const sql = try zql.delete(testing.allocator, .{ .table = "users" });
     defer testing.allocator.free(sql);
     try testing.expectEqualStrings("DELETE FROM users", sql);
 }
@@ -269,9 +265,7 @@ test "create table if not exists" {
     const sql = try zql.createTable(testing.allocator, .{
         .table         = "users",
         .if_not_exists = true,
-        .cols          = &.{
-            .{ .name = "id", .type = "INTEGER" },
-        },
+        .cols          = &.{.{ .name = "id", .type = "INTEGER" }},
     });
     defer testing.allocator.free(sql);
     try testing.expectEqualStrings(
@@ -283,9 +277,7 @@ test "create table if not exists" {
 // ── DROP TABLE ────────────────────────────────────────────────────────────────
 
 test "drop table" {
-    const sql = try zql.dropTable(testing.allocator, .{
-        .table = "users",
-    });
+    const sql = try zql.dropTable(testing.allocator, .{ .table = "users" });
     defer testing.allocator.free(sql);
     try testing.expectEqualStrings("DROP TABLE users", sql);
 }
@@ -391,58 +383,6 @@ test "where like" {
     try testing.expectEqualStrings("name LIKE 'Eug%'", w);
 }
 
-// ── Composition ───────────────────────────────────────────────────────────────
-
-test "compose where with all and any" {
-    // (role = 'admin' OR role = 'mod') AND active = 1
-    const roles = try zql.any(testing.allocator, &.{ "role = 'admin'", "role = 'mod'" });
-    defer testing.allocator.free(roles);
-
-    const roles_grouped = try zql.group(testing.allocator, roles);
-    defer testing.allocator.free(roles_grouped);
-
-    const w = try zql.all(testing.allocator, &.{ roles_grouped, "active = 1" });
-    defer testing.allocator.free(w);
-
-    const sql = try zql.select(testing.allocator, .{
-        .table = "users",
-        .where = w,
-    });
-    defer testing.allocator.free(sql);
-
-    try testing.expectEqualStrings(
-        "SELECT * FROM users WHERE (role = 'admin' OR role = 'mod') AND active = 1",
-        sql,
-    );
-}
-
-test "jurisdiction query example" {
-    // Simulate selecting active Rwandan users — the pattern from our discussion
-    const w = try zql.all(testing.allocator, &.{
-        "active = 1",
-        "jurisdiction = 'RW'",
-    });
-    defer testing.allocator.free(w);
-
-    const sql = try zql.select(testing.allocator, .{
-        .table  = "users",
-        .cols   = &.{ "id", "name", "email" },
-        .where  = w,
-        .order  = &.{.{ .col = "name", .dir = .asc }},
-        .limit  = 50,
-    });
-    defer testing.allocator.free(sql);
-
-    try testing.expectEqualStrings(
-        "SELECT id, name, email FROM users " ++
-        "WHERE active = 1 AND jurisdiction = 'RW' " ++
-        "ORDER BY name ASC LIMIT 50",
-        sql,
-    );
-}
-
-// ── betweenDates ──────────────────────────────────────────────────────────────
-
 test "betweenDates" {
     const w = try zql.betweenDates(
         testing.allocator,
@@ -457,65 +397,119 @@ test "betweenDates" {
     );
 }
 
-// ── Aggregates ────────────────────────────────────────────────────────────────
+// ── Aggregates — bare ─────────────────────────────────────────────────────────
 
-test "sum with alias" {
-    const s = try zql.sum(testing.allocator, "sms_item_count", "total_sms_items");
-    defer testing.allocator.free(s);
-    try testing.expectEqualStrings("SUM(sms_item_count) AS total_sms_items", s);
-}
-
-test "sum without alias" {
-    const s = try zql.sum(testing.allocator, "amount", null);
+test "sum bare" {
+    const s = try zql.sum(testing.allocator, "amount");
     defer testing.allocator.free(s);
     try testing.expectEqualStrings("SUM(amount)", s);
 }
 
-test "count star" {
-    const s = try zql.count(testing.allocator, "*", "total");
-    defer testing.allocator.free(s);
-    try testing.expectEqualStrings("COUNT(*) AS total", s);
-}
-
-test "count without alias" {
-    const s = try zql.count(testing.allocator, "*", null);
+test "count bare" {
+    const s = try zql.count(testing.allocator, "*");
     defer testing.allocator.free(s);
     try testing.expectEqualStrings("COUNT(*)", s);
 }
 
-test "avg with alias" {
-    const s = try zql.avg(testing.allocator, "price", "avg_price");
+test "avg bare" {
+    const s = try zql.avg(testing.allocator, "price");
     defer testing.allocator.free(s);
-    try testing.expectEqualStrings("AVG(price) AS avg_price", s);
+    try testing.expectEqualStrings("AVG(price)", s);
 }
 
-test "min with alias" {
-    const s = try zql.min(testing.allocator, "price", "min_price");
+test "min bare" {
+    const s = try zql.min(testing.allocator, "price");
     defer testing.allocator.free(s);
-    try testing.expectEqualStrings("MIN(price) AS min_price", s);
+    try testing.expectEqualStrings("MIN(price)", s);
 }
 
-test "max with alias" {
-    const s = try zql.max(testing.allocator, "price", "max_price");
+test "max bare" {
+    const s = try zql.max(testing.allocator, "price");
     defer testing.allocator.free(s);
-    try testing.expectEqualStrings("MAX(price) AS max_price", s);
+    try testing.expectEqualStrings("MAX(price)", s);
 }
 
-test "coalesce" {
+test "coalesce bare" {
     const s = try zql.coalesce(testing.allocator, "nickname", "'anonymous'");
     defer testing.allocator.free(s);
     try testing.expectEqualStrings("COALESCE(nickname, 'anonymous')", s);
 }
 
-test "cast" {
+test "cast bare" {
     const s = try zql.cast(testing.allocator, "price", "INTEGER");
     defer testing.allocator.free(s);
     try testing.expectEqualStrings("CAST(price AS INTEGER)", s);
 }
 
-// ── Real world query: sms aggregation ────────────────────────────────────────
+// ── Aggregates — aliased ──────────────────────────────────────────────────────
 
-test "sms aggregation query with arena" {
+test "sumAs" {
+    const s = try zql.sumAs(testing.allocator, "sms_item_count", "total_sms_items");
+    defer testing.allocator.free(s);
+    try testing.expectEqualStrings("SUM(sms_item_count) AS total_sms_items", s);
+}
+
+test "countAs" {
+    const s = try zql.countAs(testing.allocator, "*", "total");
+    defer testing.allocator.free(s);
+    try testing.expectEqualStrings("COUNT(*) AS total", s);
+}
+
+test "avgAs" {
+    const s = try zql.avgAs(testing.allocator, "price", "avg_price");
+    defer testing.allocator.free(s);
+    try testing.expectEqualStrings("AVG(price) AS avg_price", s);
+}
+
+test "minAs" {
+    const s = try zql.minAs(testing.allocator, "price", "min_price");
+    defer testing.allocator.free(s);
+    try testing.expectEqualStrings("MIN(price) AS min_price", s);
+}
+
+test "maxAs" {
+    const s = try zql.maxAs(testing.allocator, "price", "max_price");
+    defer testing.allocator.free(s);
+    try testing.expectEqualStrings("MAX(price) AS max_price", s);
+}
+
+test "coalesceAs" {
+    const s = try zql.coalesceAs(testing.allocator, "nickname", "'anonymous'", "display_name");
+    defer testing.allocator.free(s);
+    try testing.expectEqualStrings("COALESCE(nickname, 'anonymous') AS display_name", s);
+}
+
+test "castAs" {
+    const s = try zql.castAs(testing.allocator, "price", "INTEGER", "int_price");
+    defer testing.allocator.free(s);
+    try testing.expectEqualStrings("CAST(price AS INTEGER) AS int_price", s);
+}
+
+// ── WHERE composition ─────────────────────────────────────────────────────────
+
+test "compose where with all and any" {
+    const roles   = try zql.any(testing.allocator, &.{ "role = 'admin'", "role = 'mod'" });
+    defer testing.allocator.free(roles);
+    const grouped = try zql.group(testing.allocator, roles);
+    defer testing.allocator.free(grouped);
+    const w       = try zql.all(testing.allocator, &.{ grouped, "active = 1" });
+    defer testing.allocator.free(w);
+
+    const sql = try zql.select(testing.allocator, .{
+        .table = "users",
+        .where = w,
+    });
+    defer testing.allocator.free(sql);
+
+    try testing.expectEqualStrings(
+        "SELECT * FROM users WHERE (role = 'admin' OR role = 'mod') AND active = 1",
+        sql,
+    );
+}
+
+// ── Real world: sms aggregation with arena ────────────────────────────────────
+
+test "sms aggregation query" {
     var arena = std.heap.ArenaAllocator.init(testing.allocator);
     defer arena.deinit();
     const a = arena.allocator();
@@ -523,7 +517,7 @@ test "sms aggregation query with arena" {
     const sql = try zql.select(a, .{
         .table = "sms",
         .cols  = &.{
-            try zql.sum(a, "sms_item_count", "total_sms_items"),
+            try zql.sumAs(a, "sms_item_count", "total_sms_items"),
             "sms.retry_count",
         },
         .where = try zql.all(a, &.{
@@ -539,6 +533,32 @@ test "sms aggregation query with arena" {
         " WHERE account_id = '74'" ++
         " AND sms.created_at BETWEEN '2026-03-01 00:00:00' AND '2026-04-01 00:00:00'" ++
         " GROUP BY retry_count",
+        sql,
+    );
+}
+
+// ── Jurisdiction query example ────────────────────────────────────────────────
+
+test "jurisdiction query" {
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+
+    const sql = try zql.select(a, .{
+        .table  = "users",
+        .cols   = &.{ "id", "name", "email" },
+        .where  = try zql.all(a, &.{
+            "active = 1",
+            "jurisdiction = 'RW'",
+        }),
+        .order  = &.{.{ .col = "name", .dir = .asc }},
+        .limit  = 50,
+    });
+
+    try testing.expectEqualStrings(
+        "SELECT id, name, email FROM users " ++
+        "WHERE active = 1 AND jurisdiction = 'RW' " ++
+        "ORDER BY name ASC LIMIT 50",
         sql,
     );
 }
