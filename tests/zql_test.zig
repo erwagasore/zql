@@ -440,3 +440,105 @@ test "jurisdiction query example" {
         sql,
     );
 }
+
+// ── betweenDates ──────────────────────────────────────────────────────────────
+
+test "betweenDates" {
+    const w = try zql.betweenDates(
+        testing.allocator,
+        "sms.created_at",
+        "2026-03-01 00:00:00",
+        "2026-04-01 00:00:00",
+    );
+    defer testing.allocator.free(w);
+    try testing.expectEqualStrings(
+        "sms.created_at BETWEEN '2026-03-01 00:00:00' AND '2026-04-01 00:00:00'",
+        w,
+    );
+}
+
+// ── Aggregates ────────────────────────────────────────────────────────────────
+
+test "sum with alias" {
+    const s = try zql.sum(testing.allocator, "sms_item_count", "total_sms_items");
+    defer testing.allocator.free(s);
+    try testing.expectEqualStrings("SUM(sms_item_count) AS total_sms_items", s);
+}
+
+test "sum without alias" {
+    const s = try zql.sum(testing.allocator, "amount", null);
+    defer testing.allocator.free(s);
+    try testing.expectEqualStrings("SUM(amount)", s);
+}
+
+test "count star" {
+    const s = try zql.count(testing.allocator, "*", "total");
+    defer testing.allocator.free(s);
+    try testing.expectEqualStrings("COUNT(*) AS total", s);
+}
+
+test "count without alias" {
+    const s = try zql.count(testing.allocator, "*", null);
+    defer testing.allocator.free(s);
+    try testing.expectEqualStrings("COUNT(*)", s);
+}
+
+test "avg with alias" {
+    const s = try zql.avg(testing.allocator, "price", "avg_price");
+    defer testing.allocator.free(s);
+    try testing.expectEqualStrings("AVG(price) AS avg_price", s);
+}
+
+test "min with alias" {
+    const s = try zql.min(testing.allocator, "price", "min_price");
+    defer testing.allocator.free(s);
+    try testing.expectEqualStrings("MIN(price) AS min_price", s);
+}
+
+test "max with alias" {
+    const s = try zql.max(testing.allocator, "price", "max_price");
+    defer testing.allocator.free(s);
+    try testing.expectEqualStrings("MAX(price) AS max_price", s);
+}
+
+test "coalesce" {
+    const s = try zql.coalesce(testing.allocator, "nickname", "'anonymous'");
+    defer testing.allocator.free(s);
+    try testing.expectEqualStrings("COALESCE(nickname, 'anonymous')", s);
+}
+
+test "cast" {
+    const s = try zql.cast(testing.allocator, "price", "INTEGER");
+    defer testing.allocator.free(s);
+    try testing.expectEqualStrings("CAST(price AS INTEGER)", s);
+}
+
+// ── Real world query: sms aggregation ────────────────────────────────────────
+
+test "sms aggregation query with arena" {
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+
+    const sql = try zql.select(a, .{
+        .table = "sms",
+        .cols  = &.{
+            try zql.sum(a, "sms_item_count", "total_sms_items"),
+            "sms.retry_count",
+        },
+        .where = try zql.all(a, &.{
+            "account_id = '74'",
+            try zql.betweenDates(a, "sms.created_at", "2026-03-01 00:00:00", "2026-04-01 00:00:00"),
+        }),
+        .group = &.{"retry_count"},
+    });
+
+    try testing.expectEqualStrings(
+        "SELECT SUM(sms_item_count) AS total_sms_items, sms.retry_count" ++
+        " FROM sms" ++
+        " WHERE account_id = '74'" ++
+        " AND sms.created_at BETWEEN '2026-03-01 00:00:00' AND '2026-04-01 00:00:00'" ++
+        " GROUP BY retry_count",
+        sql,
+    );
+}

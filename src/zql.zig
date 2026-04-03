@@ -491,3 +491,81 @@ pub fn isNotNull(allocator: std.mem.Allocator, col: []const u8) ![]const u8 {
 pub fn like(allocator: std.mem.Allocator, col: []const u8, pattern: []const u8) ![]const u8 {
     return std.fmt.allocPrint(allocator, "{s} LIKE '{s}'", .{ col, pattern });
 }
+
+/// Builds col BETWEEN 'low' AND 'high' with quoted datetime strings.
+///   zql.betweenDates(a, "created_at", "2026-03-01 00:00:00", "2026-04-01 00:00:00")
+///   → "created_at BETWEEN '2026-03-01 00:00:00' AND '2026-04-01 00:00:00'"
+pub fn betweenDates(
+    allocator: std.mem.Allocator,
+    col:       []const u8,
+    from:      []const u8,
+    to:        []const u8,
+) ![]const u8 {
+    return std.fmt.allocPrint(
+        allocator,
+        "{s} BETWEEN '{s}' AND '{s}'",
+        .{ col, from, to },
+    );
+}
+
+// ── Aggregate functions ───────────────────────────────────────────────────────
+//
+// Each returns a SQL expression string suitable for use in .cols.
+// Pass null for alias to omit the AS clause.
+// All return caller-owned slices.
+
+fn aggregate(
+    allocator: std.mem.Allocator,
+    func:      []const u8,
+    col:       []const u8,
+    alias:     ?[]const u8,
+) ![]const u8 {
+    if (alias) |a| {
+        return std.fmt.allocPrint(allocator, "{s}({s}) AS {s}", .{ func, col, a });
+    }
+    return std.fmt.allocPrint(allocator, "{s}({s})", .{ func, col });
+}
+
+/// SUM(col) or SUM(col) AS alias
+///   try zql.sum(a, "amount", "total")   → "SUM(amount) AS total"
+///   try zql.sum(a, "amount", null)      → "SUM(amount)"
+pub fn sum(allocator: std.mem.Allocator, col: []const u8, alias: ?[]const u8) ![]const u8 {
+    return aggregate(allocator, "SUM", col, alias);
+}
+
+/// COUNT(col) or COUNT(col) AS alias.
+/// Pass "*" for col to get COUNT(*).
+///   try zql.count(a, "*", "total")      → "COUNT(*) AS total"
+pub fn count(allocator: std.mem.Allocator, col: []const u8, alias: ?[]const u8) ![]const u8 {
+    return aggregate(allocator, "COUNT", col, alias);
+}
+
+/// AVG(col) or AVG(col) AS alias
+///   try zql.avg(a, "price", "avg_price") → "AVG(price) AS avg_price"
+pub fn avg(allocator: std.mem.Allocator, col: []const u8, alias: ?[]const u8) ![]const u8 {
+    return aggregate(allocator, "AVG", col, alias);
+}
+
+/// MIN(col) or MIN(col) AS alias
+///   try zql.min(a, "price", "min_price") → "MIN(price) AS min_price"
+pub fn min(allocator: std.mem.Allocator, col: []const u8, alias: ?[]const u8) ![]const u8 {
+    return aggregate(allocator, "MIN", col, alias);
+}
+
+/// MAX(col) or MAX(col) AS alias
+///   try zql.max(a, "price", "max_price") → "MAX(price) AS max_price"
+pub fn max(allocator: std.mem.Allocator, col: []const u8, alias: ?[]const u8) ![]const u8 {
+    return aggregate(allocator, "MAX", col, alias);
+}
+
+/// COALESCE(col, fallback)
+///   try zql.coalesce(a, "nickname", "'anonymous'") → "COALESCE(nickname, 'anonymous')"
+pub fn coalesce(allocator: std.mem.Allocator, col: []const u8, fallback: []const u8) ![]const u8 {
+    return std.fmt.allocPrint(allocator, "COALESCE({s}, {s})", .{ col, fallback });
+}
+
+/// CAST(col AS type)
+///   try zql.cast(a, "price", "INTEGER") → "CAST(price AS INTEGER)"
+pub fn cast(allocator: std.mem.Allocator, col: []const u8, as_type: []const u8) ![]const u8 {
+    return std.fmt.allocPrint(allocator, "CAST({s} AS {s})", .{ col, as_type });
+}
