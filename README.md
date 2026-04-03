@@ -7,21 +7,162 @@ A zero-dependency, database-agnostic SQL query builder for Zig.
 - **Idiomatic** — follows Zig standard library memory conventions
 - **Simple** — one function per statement type, plain struct config
 
+## Why zql over raw SQL strings
+
+### Compile-time direction safety
+
+Raw SQL lets you write `"ORDER BY name DESK"` — a typo that compiles, runs, and silently
+returns wrong results. zql's `Direction` enum makes that impossible:
+
+```zig
+// Raw SQL — valid Zig, wrong results at runtime
+"ORDER BY name DESK"
+
+// zql — caught at compile time
+.order = &.{.{ .col = "name", .dir = .desk }}
+// error: no field 'desk' in enum 'Direction'
+```
+
+### Typed LIMIT and OFFSET
+
+Format string errors with numeric clauses are easy to make and silent:
+
+```zig
+// Raw SQL — {s} expects a string, usize causes a runtime panic or garbage output
+const sql = try std.fmt.allocPrint(a, "SELECT * FROM users LIMIT {s}", .{limit});
+
+// zql — limit is typed as ?usize, passing a string is a compile error
+.limit = limit,  // correct
+.limit = "50",   // compile error
+```
+
+### Correct clause ordering guaranteed
+
+SQL requires a strict clause order: `WHERE` before `GROUP BY`, `GROUP BY` before `HAVING`,
+`HAVING` before `ORDER BY`. Raw SQL lets you get this wrong silently. zql always emits
+clauses in the correct order regardless of the order you specify them in the config struct:
+
+```zig
+// Raw SQL — valid Zig, invalid SQL, silent runtime failure
+"SELECT * FROM users GROUP BY country WHERE active = 1"
+
+// zql — WHERE always emitted before GROUP BY, always correct
+.where = "active = 1",
+.group = &.{"country"},
+```
+
+### Conditional clauses without string surgery
+
+Dynamically building a query in raw SQL means `ArrayList`, careful spacing, and
+concatenation bugs. In zql optional fields are just `null`:
+
+```zig
+// zql — clean, correct, readable
+const sql = try zql.select(a, .{
+    .table  = "users",
+    .where  = if (filter_active) "active = 1" else null,
+    .limit  = if (paginated) page_size else null,
+    .offset = if (paginated) page * page_size else null,
+});
+```
+
+The raw SQL equivalent requires building the string piece by piece with an `ArrayList`
+and careful attention to spacing between clauses.
+
+### Composable WHERE without concatenation
+
+```zig
+// Conditionally add filters
+var conditions = std.ArrayList([]const u8).init(a);
+try conditions.append("active = 1");
+if (jurisdiction) |j| {
+    try conditions.append(try std.fmt.allocPrint(a, "jurisdiction = '{s}'", .{j}));
+}
+
+const sql = try zql.select(a, .{
+    .table = "users",
+    .where = try zql.all(a, conditions.items),
+});
+```
+
+### Refactoring safety
+
+Column names in `.cols`, `.group`, and `.order` are struct fields — visible in diffs,
+easy to grep, and can be centralised as constants:
+
+```zig
+const USER_COLS = &.{ "id", "name", "email" };
+
+// Every query that selects users updated in one place
+const sql = try zql.select(a, .{
+    .table = "users",
+    .cols  = USER_COLS,
+});
+```
+
+### When to use raw SQL instead
+
+zql covers the common 80% — CRUD, pagination, filters, aggregates, joins. For the
+remaining 20% (CTEs, window functions, subqueries), every `[]const u8` field accepts
+raw SQL directly:
+
+```zig
+// Window function in cols — raw string, works fine
+.cols = &.{
+    "id",
+    "ROW_NUMBER() OVER (PARTITION BY user_id ORDER BY created_at DESC) AS rn",
+},
+
+// Raw HAVING with subquery
+.having = "SUM(total) > (SELECT AVG(total) FROM orders)",
+
+// For queries zql cannot model at all, skip it entirely
+const sql = "INSERT INTO users (id, name) ON CONFLICT(id) DO UPDATE SET name = excluded.name";
+```
+
+---
+
 ## Memory contract
 
-Every function that returns a `[]const u8` allocates with the provided
-allocator. The caller owns the result and must free it with the same allocator.
+Every function that returns a `[]const u8` allocates with the provided allocator.
+The caller owns the result and must free it with the same allocator.
 
 ```zig
+// GPA — explicit defer
 const sql = try zql.select(allocator, .{ .table = "users" });
-defer allocator.free(sql); // caller frees
+defer allocator.free(sql);
 ```
 
-In an httpz handler, use `req.arena` — no defer needed:
-
 ```zig
+// httpz handler — req.arena frees everything at end of request, no defer needed
 const sql = try zql.select(req.arena, .{ .table = "users", .limit = 50 });
 ```
+
+```zig
+// Arena — one deinit frees all intermediate and final allocations
+var arena = std.heap.ArenaAllocator.init(allocator);
+defer arena.deinit();
+const a = arena.allocator();
+
+const sql = try zql.select(a, .{
+    .table = "users",
+    .cols  = &.{ try zql.sumAs(a, "amount", "total"), "user_id" },
+    .where = try zql.all(a, &.{
+        "active = 1",
+        try zql.betweenDates(a, "created_at", "2026-01-01", "2026-04-01"),
+    }),
+    .group = &.{"user_id"},
+});
+```
+
+```zig
+// Fixed buffer — no heap, no free
+var buf: [512]u8 = undefined;
+var fba = std.heap.FixedBufferAllocator.init(&buf);
+const sql = try zql.select(fba.allocator(), .{ .table = "users", .where = "active = 1" });
+```
+
+---
 
 ## Installation
 
@@ -29,7 +170,7 @@ Add to your `build.zig.zon`:
 
 ```zig
 .dependencies = .{
-    .query = .{
+    .zql = .{
         .url  = "https://github.com/yourname/zql/archive/refs/tags/v0.1.0.tar.gz",
         .hash = "...",
     },
@@ -40,8 +181,10 @@ Add to your `build.zig`:
 
 ```zig
 const zql_dep = b.dependency("zql", .{});
-exe.root_module.addImport("zql", query_dep.module("zql"));
+exe.root_module.addImport("zql", zql_dep.module("zql"));
 ```
+
+---
 
 ## Usage
 
@@ -80,11 +223,11 @@ const sql = try zql.select(allocator, .{
     .where = "users.active = 1",
 });
 
-// SELECT user_id, COUNT(*) as total FROM orders
+// SELECT user_id, COUNT(*) AS total FROM orders
 // GROUP BY user_id HAVING COUNT(*) > 5
 const sql = try zql.select(allocator, .{
     .table  = "orders",
-    .cols   = &.{ "user_id", "COUNT(*) as total" },
+    .cols   = &.{ "user_id", try zql.countAs(allocator, "*", "total") },
     .group  = &.{"user_id"},
     .having = "COUNT(*) > 5",
 });
@@ -139,7 +282,7 @@ const sql = try zql.delete(allocator, .{
     .where = "id = 1",
 });
 
-// DELETE FROM users  (all rows)
+// DELETE FROM users (all rows)
 const sql = try zql.delete(allocator, .{
     .table = "users",
 });
@@ -148,7 +291,7 @@ const sql = try zql.delete(allocator, .{
 ### CREATE TABLE
 
 ```zig
-const sql = try query.createTable(allocator, .{
+const sql = try zql.createTable(allocator, .{
     .table         = "users",
     .if_not_exists = true,
     .cols          = &.{
@@ -162,7 +305,7 @@ const sql = try query.createTable(allocator, .{
 ### DROP TABLE
 
 ```zig
-const sql = try query.dropTable(allocator, .{
+const sql = try zql.dropTable(allocator, .{
     .table     = "users",
     .if_exists = true,
 });
@@ -171,7 +314,7 @@ const sql = try query.dropTable(allocator, .{
 ### CREATE INDEX
 
 ```zig
-const sql = try query.createIndex(allocator, .{
+const sql = try zql.createIndex(allocator, .{
     .name          = "idx_users_email",
     .table         = "users",
     .cols          = &.{"email"},
@@ -182,71 +325,104 @@ const sql = try query.createIndex(allocator, .{
 
 ### WHERE helpers
 
-Compose WHERE clauses from pieces — all return caller-owned slices:
+All return caller-owned slices. Compose freely — each helper is just a string.
 
 ```zig
 // AND
-const w = try query.all(allocator, &.{ "active = 1", "age > 18" });
+const w = try zql.all(allocator, &.{ "active = 1", "age > 18" });
 // → "active = 1 AND age > 18"
 
 // OR
-const w = try query.any(allocator, &.{ "role = 'admin'", "role = 'mod'" });
+const w = try zql.any(allocator, &.{ "role = 'admin'", "role = 'mod'" });
 // → "role = 'admin' OR role = 'mod'"
 
 // Grouping
-const w = try query.group(allocator, "a = 1 OR b = 2");
+const w = try zql.group(allocator, "a = 1 OR b = 2");
 // → "(a = 1 OR b = 2)"
 
 // NOT
-const w = try query.not(allocator, "active = 1");
+const w = try zql.not(allocator, "active = 1");
 // → "NOT (active = 1)"
 
-// IN
-const w = try query.in(allocator, "id", &.{ "1", "2", "3" });
+// IN / NOT IN
+const w = try zql.in(allocator, "id", &.{ "1", "2", "3" });
 // → "id IN (1, 2, 3)"
 
-// NOT IN
-const w = try query.notIn(allocator, "id", &.{ "1", "2" });
+const w = try zql.notIn(allocator, "id", &.{ "1", "2" });
 // → "id NOT IN (1, 2)"
 
-// BETWEEN
-const w = try query.between(allocator, "age", "18", "65");
+// BETWEEN (numeric)
+const w = try zql.between(allocator, "age", "18", "65");
 // → "age BETWEEN 18 AND 65"
 
+// BETWEEN (datetime — quotes the values for you)
+const w = try zql.betweenDates(allocator, "created_at", "2026-01-01", "2026-04-01");
+// → "created_at BETWEEN '2026-01-01' AND '2026-04-01'"
+
 // IS NULL / IS NOT NULL
-const w = try query.isNull(allocator, "deleted_at");
-const w = try query.isNotNull(allocator, "email");
+const w = try zql.isNull(allocator, "deleted_at");
+const w = try zql.isNotNull(allocator, "email");
 
 // LIKE
-const w = try query.like(allocator, "name", "Eug%");
+const w = try zql.like(allocator, "name", "Eug%");
 // → "name LIKE 'Eug%'"
 ```
 
-Compose complex conditions:
+Compose complex conditions with an arena for clean inline nesting:
 
 ```zig
 // (role = 'admin' OR role = 'mod') AND active = 1
-const roles   = try query.any(allocator, &.{ "role = 'admin'", "role = 'mod'" });
-defer allocator.free(roles);
+var arena = std.heap.ArenaAllocator.init(allocator);
+defer arena.deinit();
+const a = arena.allocator();
 
-const grouped = try query.group(allocator, roles);
-defer allocator.free(grouped);
-
-const w       = try query.all(allocator, &.{ grouped, "active = 1" });
-defer allocator.free(w);
-
-const sql = try zql.select(allocator, .{
+const sql = try zql.select(a, .{
     .table = "users",
-    .where = w,
+    .where = try zql.all(a, &.{
+        try zql.group(a, try zql.any(a, &.{ "role = 'admin'", "role = 'mod'" })),
+        "active = 1",
+    }),
 });
-defer allocator.free(sql);
 ```
+
+### Aggregate functions
+
+Two functions per aggregate: bare and aliased.
+
+```zig
+try zql.sum(a, "amount")                          // → "SUM(amount)"
+try zql.sumAs(a, "amount", "total")               // → "SUM(amount) AS total"
+
+try zql.count(a, "*")                             // → "COUNT(*)"
+try zql.countAs(a, "*", "total")                  // → "COUNT(*) AS total"
+
+try zql.avg(a, "price")                           // → "AVG(price)"
+try zql.avgAs(a, "price", "avg_price")            // → "AVG(price) AS avg_price"
+
+try zql.min(a, "price")                           // → "MIN(price)"
+try zql.minAs(a, "price", "min_price")            // → "MIN(price) AS min_price"
+
+try zql.max(a, "price")                           // → "MAX(price)"
+try zql.maxAs(a, "price", "max_price")            // → "MAX(price) AS max_price"
+
+try zql.coalesce(a, "nickname", "'anon'")         // → "COALESCE(nickname, 'anon')"
+try zql.coalesceAs(a, "nickname", "'anon'", "display_name")
+// → "COALESCE(nickname, 'anon') AS display_name"
+
+try zql.cast(a, "price", "INTEGER")               // → "CAST(price AS INTEGER)"
+try zql.castAs(a, "price", "INTEGER", "int_price")
+// → "CAST(price AS INTEGER) AS int_price"
+```
+
+---
 
 ## Running tests
 
 ```bash
 zig build test
 ```
+
+---
 
 ## License
 
