@@ -12,12 +12,8 @@ pub fn build(b: *std.Build) void {
     });
 
     // ── Tests ─────────────────────────────────────────────────────────────────
-    const tests = b.addTest(.{
-        .root_source_file = b.path("tests/zql_test.zig"),
-        .target           = target,
-        .optimize         = optimize,
-    });
-    tests.root_module.addImport("zql", lib_mod);
+    // Tests live alongside the code in src/zql.zig (Zig convention).
+    const tests = b.addTest(.{ .root_module = lib_mod });
 
     const run_tests = b.addRunArtifact(tests);
     const test_step = b.step("test", "Run tests");

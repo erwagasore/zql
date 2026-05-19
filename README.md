@@ -4,8 +4,32 @@ A zero-dependency, database-agnostic SQL query builder for Zig.
 
 - **Pure Zig** — no C bindings, no runtime dependencies
 - **Database-agnostic** — works with SQLite, PostgreSQL, rqlite, or any SQL database
-- **Idiomatic** — follows Zig standard library memory conventions
+- **Idiomatic** — built on `std.Io.Writer`, follows Zig standard library memory conventions
 - **Simple** — one function per statement type, plain struct config
+- **Zig 0.16+**
+
+## Scope: value binding is your driver's job
+
+zql is a SQL **string builder** — it produces SQL text from typed Zig
+configs. It does **not** escape or bind values. Concatenating untrusted
+input directly into `.where`, `.values`, `.set`, etc. is a SQL-injection
+vulnerability, and preventing it is explicitly **not** zql's responsibility.
+
+In production code, render placeholder SQL with whatever binding syntax
+your driver uses (`?` for SQLite/MySQL, `$1` for Postgres) and pass the
+user input as separately-bound parameters:
+
+```zig
+const sql = try zql.select(a, .{
+    .table = "users",
+    .where = "email = ?",      // ← placeholder, NOT "email = '" ++ input ++ "'"
+});
+// Then hand off to your driver:
+// try db.exec(sql, .{ user_input_email });
+```
+
+zql renders the SQL string; your driver binds the values. This separation
+is what keeps zql dialect-neutral — and it's what keeps user input safe.
 
 ## Why zql over raw SQL strings
 
@@ -73,10 +97,11 @@ and careful attention to spacing between clauses.
 
 ```zig
 // Conditionally add filters
-var conditions = std.ArrayList([]const u8).init(a);
-try conditions.append("active = 1");
+var conditions: std.ArrayList([]const u8) = .empty;
+defer conditions.deinit(a);            // no-op with arena, required with GPA
+try conditions.append(a, "active = 1");
 if (jurisdiction) |j| {
-    try conditions.append(try std.fmt.allocPrint(a, "jurisdiction = '{s}'", .{j}));
+    try conditions.append(a, try std.fmt.allocPrint(a, "jurisdiction = '{s}'", .{j}));
 }
 
 const sql = try zql.select(a, .{
@@ -103,28 +128,27 @@ const sql = try zql.select(a, .{
 ### When to use raw SQL instead
 
 zql covers the common 80% — CRUD, pagination, filters, aggregates, joins. For the
-remaining 20% (CTEs, window functions, subqueries), every `[]const u8` field accepts
-raw SQL directly:
+remaining 20%, every `[]const u8` field accepts raw SQL directly:
 
 ```zig
-// Window function in cols — raw string, works fine
-.cols = &.{
-    "id",
-    "ROW_NUMBER() OVER (PARTITION BY user_id ORDER BY created_at DESC) AS rn",
-},
-
-// Raw HAVING with subquery
 .having = "SUM(total) > (SELECT AVG(total) FROM orders)",
-
-// For queries zql cannot model at all, skip it entirely
-const sql = "INSERT INTO users (id, name) ON CONFLICT(id) DO UPDATE SET name = excluded.name";
 ```
+
+See [Dialect-specific features](#dialect-specific-features-use-raw-sql) for
+a catalogue of common features intentionally not modeled (upserts, RETURNING,
+CTEs, window functions, UNION, ALTER TABLE, quoted identifiers, …) with
+ready-to-paste recipes for each.
 
 ---
 
 ## Memory contract
 
-Every function that returns a `[]const u8` allocates with the provided allocator.
+Every function that returns a `[]u8` performs **exactly one allocation**,
+sized precisely to the output — no grow-reallocs during construction, no
+shrink-to-fit at the end, no transient buffers. This matters most for arena
+allocators, where intermediate reallocs would otherwise stay resident until
+`arena.deinit()`.
+
 The caller owns the result and must free it with the same allocator.
 
 ```zig
@@ -161,6 +185,105 @@ var buf: [512]u8 = undefined;
 var fba = std.heap.FixedBufferAllocator.init(&buf);
 const sql = try zql.select(fba.allocator(), .{ .table = "users", .where = "active = 1" });
 ```
+
+---
+
+## Writer API (zero intermediate allocations)
+
+Every statement has a paired `writeX` variant that writes directly to any
+`std.Io.Writer`. Use it when you already have a writer (file, socket,
+in-memory buffer) and want to skip the intermediate allocation:
+
+```zig
+// Write SQL straight into a fixed buffer
+var buf: [256]u8 = undefined;
+var w: std.Io.Writer = .fixed(&buf);
+try zql.writeSelect(&w, .{ .table = "users", .where = "active = 1" });
+// w.buffered() → "SELECT * FROM users WHERE active = 1"
+```
+
+Available pairs: `select`/`writeSelect`, `insert`/`writeInsert`,
+`insertMany`/`writeInsertMany`, `update`/`writeUpdate`, `delete`/`writeDelete`,
+`createTable`/`writeCreateTable`, `dropTable`/`writeDropTable`,
+`createIndex`/`writeCreateIndex`. The allocator forms are thin convenience
+wrappers around the writer forms.
+
+---
+
+## Errors
+
+`zql.Error` is the union of every validation error any function may return:
+
+```zig
+pub const Error = error{
+    ColsValuesMismatch, // insert: cols.len != values.len; insertMany: row mismatch
+    NoRows,             // insertMany: rows is empty
+    NoSetClauses,       // update: set is empty
+    NoColumns,          // createTable / createIndex: cols is empty
+};
+```
+
+Each `writeX` function declares the precise subset it can return — read its
+signature to see which apply. For a catch-all in caller code:
+
+```zig
+fn handler(req: *Request) (zql.Error || std.Io.Writer.Error || Allocator.Error)!Response {
+    const sql = try zql.insert(req.arena, .{ ... });
+    ...
+}
+```
+
+---
+
+## Types
+
+Shared value types used across the API:
+
+```zig
+/// Sort direction for ORDER BY terms.
+pub const Direction = enum { asc, desc };
+
+/// A single ORDER BY term. Used in SelectConfig.order.
+pub const Order = struct {
+    col: []const u8,
+    dir: Direction = .asc,
+};
+
+/// Column definition for CREATE TABLE. Used in CreateTableConfig.cols.
+pub const Column = struct {
+    name:        []const u8,
+    type:        []const u8,
+    constraints: []const u8 = "",
+};
+```
+
+Every statement also has its own config struct — `SelectConfig`,
+`InsertConfig`, `InsertManyConfig`, `UpdateConfig`, `DeleteConfig`,
+`CreateTableConfig`, `DropTableConfig`, `CreateIndexConfig`. Field names
+and defaults appear in the [Usage](#usage) examples below, and the full
+definitions live in [`src/zql.zig`](src/zql.zig).
+
+---
+
+## Extending: custom statement types
+
+The single-allocation renderer is public. Pair a config struct with a writer
+function, then call `zql.renderOwned`:
+
+```zig
+pub const TruncateConfig = struct { table: []const u8 = "" };
+
+pub fn writeTruncate(w: *std.Io.Writer, cfg: TruncateConfig) std.Io.Writer.Error!void {
+    try w.print("TRUNCATE TABLE {s}", .{cfg.table});
+}
+
+pub fn truncate(gpa: Allocator, cfg: TruncateConfig) ![]u8 {
+    return zql.renderOwned(gpa, cfg, writeTruncate);
+}
+```
+
+You get the same one-allocation-per-call memory profile as the built-in
+statements, for free.
 
 ---
 
@@ -243,14 +366,6 @@ const sql = try zql.insert(allocator, .{
     .values = &.{ "'Eugene'", "'eugene@pindo.io'" },
 });
 
-// INSERT OR REPLACE INTO users (id, name) VALUES (1, 'Eugene')
-const sql = try zql.insert(allocator, .{
-    .table   = "users",
-    .cols    = &.{ "id", "name" },
-    .values  = &.{ "1", "'Eugene'" },
-    .replace = true,
-});
-
 // Multi-row insert
 const sql = try zql.insertMany(allocator, .{
     .table = "users",
@@ -261,6 +376,11 @@ const sql = try zql.insertMany(allocator, .{
     },
 });
 ```
+
+> Dialect-specific upserts (SQLite `INSERT OR REPLACE` / `INSERT OR IGNORE`,
+> Postgres `ON CONFLICT`, MySQL `INSERT IGNORE`) are not modeled by zql — they
+> would force one dialect's syntax on every user. Write those statements as
+> raw SQL; see [When to use raw SQL instead](#when-to-use-raw-sql-instead).
 
 ### UPDATE
 
@@ -344,9 +464,14 @@ const w = try zql.group(allocator, "a = 1 OR b = 2");
 const w = try zql.not(allocator, "active = 1");
 // → "NOT (active = 1)"
 
-// IN / NOT IN
+// IN / NOT IN — values are emitted verbatim; pre-quote strings yourself.
+// For user input prefer a parameterized `col IN (?, ?, ?)` via your driver
+// instead of inlining values here.
 const w = try zql.in(allocator, "id", &.{ "1", "2", "3" });
 // → "id IN (1, 2, 3)"
+
+const w = try zql.in(allocator, "role", &.{ "'admin'", "'mod'" });
+// → "role IN ('admin', 'mod')"
 
 const w = try zql.notIn(allocator, "id", &.{ "1", "2" });
 // → "id NOT IN (1, 2)"
@@ -416,6 +541,125 @@ try zql.castAs(a, "price", "INTEGER", "int_price")
 
 ---
 
+## Dialect-specific features (use raw SQL)
+
+These common SQL features aren't modeled by zql because their syntax varies
+across databases. Every `[]const u8` config field accepts raw SQL — and for
+statements zql can't model at all, build the string directly. Each recipe
+below stays compatible with zql's single-allocation memory profile (the raw
+string is just another `[]const u8` zql copies through, or a one-shot
+`allocPrint` you control).
+
+### Upserts
+
+```zig
+// Postgres / modern SQLite
+const sql = "INSERT INTO users (id, name) VALUES (1, 'Eugene') " ++
+            "ON CONFLICT (id) DO UPDATE SET name = excluded.name";
+
+// SQLite legacy
+const sql = "INSERT OR REPLACE INTO users (id, name) VALUES (1, 'Eugene')";
+
+// MySQL
+const sql = "INSERT INTO users (id, name) VALUES (1, 'Eugene') " ++
+            "ON DUPLICATE KEY UPDATE name = VALUES(name)";
+```
+
+### RETURNING
+
+Supported by SQLite, Postgres, MariaDB (not MySQL). Append to any zql-built
+statement:
+
+```zig
+const base = try zql.insert(a, .{
+    .table  = "users",
+    .cols   = &.{ "name", "email" },
+    .values = &.{ "'Eugene'", "'e@p.io'" },
+});
+const sql = try std.fmt.allocPrint(a, "{s} RETURNING id, created_at", .{base});
+```
+
+### Subqueries
+
+Pass them inline in any text field:
+
+```zig
+const sql = try zql.select(a, .{
+    .table = "orders",
+    .where = "total > (SELECT AVG(total) FROM orders)",
+    .joins = &.{"INNER JOIN (SELECT id FROM active_users) au ON au.id = orders.user_id"},
+});
+```
+
+### CTEs (`WITH ...`)
+
+`WITH` precedes `SELECT`, which zql doesn't expose. Wrap the inner query:
+
+```zig
+const inner = try zql.select(a, .{ .table = "users", .where = "active = 1" });
+const sql   = try std.fmt.allocPrint(a,
+    "WITH active AS ({s}) SELECT * FROM active ORDER BY name", .{inner});
+```
+
+### Window functions
+
+Standard syntax across modern databases, just not modeled as a typed clause.
+Put the whole expression in `.cols`:
+
+```zig
+.cols = &.{
+    "id",
+    "ROW_NUMBER() OVER (PARTITION BY user_id ORDER BY created_at DESC) AS rn",
+    "LAG(total, 1) OVER (ORDER BY created_at) AS prev_total",
+},
+```
+
+### UNION / INTERSECT / EXCEPT
+
+Concatenate two zql-built queries with `allocPrint`:
+
+```zig
+const a_sql = try zql.select(a, .{ .table = "users",    .where = "active = 1" });
+const b_sql = try zql.select(a, .{ .table = "archived", .where = "active = 1" });
+const sql   = try std.fmt.allocPrint(a, "{s} UNION ALL {s}", .{ a_sql, b_sql });
+```
+
+### Quoted identifiers (reserved words)
+
+zql doesn't quote identifiers — quoting differs per dialect and adding the
+right kind of quote would force one dialect's convention on everyone. If a
+column or table is named after a reserved word, quote it yourself:
+
+```zig
+.cols = &.{ "id", "\"order\"" },   // standard SQL / Postgres / SQLite
+.cols = &.{ "id", "`order`"   },   // MySQL
+.cols = &.{ "id", "[order]"   },   // SQL Server
+```
+
+### `ALTER TABLE`
+
+`ADD COLUMN`, `DROP COLUMN`, `MODIFY`/`ALTER COLUMN`, and `RENAME` all differ
+across dialects. Write the statement directly:
+
+```zig
+const sql = "ALTER TABLE users ADD COLUMN nickname TEXT DEFAULT ''";
+```
+
+### Boolean and date/time literals
+
+zql passes values through as you write them — there's no normalization. Use
+each dialect's native form:
+
+```zig
+.where = "active = TRUE",                       // Postgres / MySQL
+.where = "active = 1",                          // SQLite
+.where = "created_at < NOW()",                  // Postgres / MySQL
+.where = "created_at < datetime('now')",        // SQLite
+.where = "created_at < CURRENT_TIMESTAMP",      // standard SQL — most dialects
+```
+
+---
+
 ## Running tests
 
 ```bash
@@ -424,6 +668,25 @@ zig build test
 
 ---
 
+## Examples
+
+A runnable [httpz](https://github.com/karlseguin/http.zig) web server demonstrating
+users CRUD against `req.arena` lives in [`examples/`](examples/). It has its
+own `build.zig.zon` so the httpz dep is isolated to the example — nothing
+leaks into your project when you depend on zql.
+
+```bash
+cd examples
+zig build run
+# in another shell:
+curl 'http://localhost:5882/users?active=1&limit=10'
+```
+
+See [`examples/src/web.zig`](examples/src/web.zig) for handlers covering
+list, get, create, update, delete, and an aggregate report.
+
+---
+
 ## License
 
-MIT
+MIT — see [LICENSE](LICENSE).

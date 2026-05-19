@@ -1,610 +1,914 @@
 //! zql — A zero-dependency, database-agnostic SQL query builder for Zig.
 //!
-//! Memory contract: every function that returns a []const u8 allocates with
-//! the provided allocator. The caller owns the result and must free it with
-//! the same allocator.
+//! Each statement has two entry points:
 //!
-//! Example:
-//!   const sql = try zql.select(allocator, .{ .table = "users", .limit = 50 });
-//!   defer allocator.free(sql);
+//!   1. Allocator API — returns a caller-owned slice. Use when you just want
+//!      a SQL string:
+//!
+//!        const sql = try zql.select(gpa, .{ .table = "users" });
+//!        defer gpa.free(sql);
+//!
+//!   2. Writer API — writes directly to any `std.Io.Writer`. Use when you
+//!      already have a writer (file, socket, ArrayList buffer) to avoid the
+//!      intermediate allocation:
+//!
+//!        try zql.writeSelect(&w, .{ .table = "users" });
 
-const std = @import("std");
+const std       = @import("std");
+const Allocator = std.mem.Allocator;
+const Writer    = std.Io.Writer;
+const testing   = std.testing;
 
 // ── Shared types ──────────────────────────────────────────────────────────────
 
-/// A key=value pair used in SET clauses (UPDATE) and WHERE helpers.
-pub const KV = struct {
-    key:   []const u8,
-    value: []const u8,
-};
+pub const Direction = enum { asc, desc };
 
-/// Sort direction for ORDER BY.
-pub const Direction = enum {
-    asc,
-    desc,
-
-    fn toString(self: Direction) []const u8 {
-        return switch (self) {
-            .asc  => "ASC",
-            .desc => "DESC",
-        };
-    }
-};
-
-/// A single ORDER BY term.
-pub const OrderTerm = struct {
+pub const Order = struct {
     col: []const u8,
     dir: Direction = .asc,
 };
 
+pub const Column = struct {
+    name:        []const u8,
+    type:        []const u8,
+    constraints: []const u8 = "",
+};
+
+/// Union of every validation error any `writeX` function can return. Use as
+/// `zql.Error || zql.Writer.Error || Allocator.Error` for a catch-all in
+/// callers, or catch the specific variant a function emits (see each
+/// `writeX` signature for the precise subset).
+pub const Error = error{
+    ColsValuesMismatch,
+    NoRows,
+    NoSetClauses,
+    NoColumns,
+};
+
+// ── Internal: comma-separated list ────────────────────────────────────────────
+
+fn writeList(w: *Writer, items: []const []const u8) Writer.Error!void {
+    for (items, 0..) |it, i| {
+        if (i > 0) try w.writeAll(", ");
+        try w.writeAll(it);
+    }
+}
+
+// ── Single-allocation renderer ────────────────────────────────────────────────
+
+/// Two-pass render: counts the exact output size with a `Discarding` writer,
+/// allocates that many bytes once, then fills them with a `fixed` writer.
+/// One allocation per call — no grow-reallocs, no shrink-to-fit, no wasted
+/// bytes. Important for arena allocators, where intermediate reallocs would
+/// accumulate as unfreed memory until `arena.deinit()`.
+///
+/// Exposed so callers can add their own statement types using the same
+/// single-allocation pattern. Pair a config struct with a writer function
+/// `fn(*std.Io.Writer, Cfg) !void` and pass both here:
+///
+///     pub const MyConfig = struct { ... };
+///     pub fn writeMy(w: *std.Io.Writer, cfg: MyConfig) !void { ... }
+///     pub fn my(gpa: Allocator, cfg: MyConfig) ![]u8 {
+///         return zql.renderOwned(gpa, cfg, writeMy);
+///     }
+pub fn renderOwned(gpa: Allocator, cfg: anytype, comptime writeFn: anytype) ![]u8 {
+    var scratch: [64]u8 = undefined;
+    var d: Writer.Discarding = .init(&scratch);
+    try writeFn(&d.writer, cfg);
+
+    const buf = try gpa.alloc(u8, @intCast(d.fullCount()));
+    errdefer gpa.free(buf);
+
+    var fw: Writer = .fixed(buf);
+    try writeFn(&fw, cfg);
+    return buf;
+}
+
 // ── SELECT ────────────────────────────────────────────────────────────────────
 
 pub const SelectConfig = struct {
-    /// Table to select from. Required.
-    table:  []const u8          = "",
-    /// Columns to select. Empty slice means SELECT *.
-    cols:   []const []const u8  = &.{},
-    /// Optional WHERE clause (raw SQL fragment, e.g. "active = 1").
-    where:  ?[]const u8         = null,
-    /// Optional ORDER BY terms.
-    order:  []const OrderTerm   = &.{},
-    /// Optional LIMIT.
-    limit:  ?usize              = null,
-    /// Optional OFFSET.
-    offset: ?usize              = null,
-    /// Optional JOIN clauses (raw SQL, e.g. "INNER JOIN orders ON ...").
-    joins:  []const []const u8  = &.{},
-    /// Optional GROUP BY columns.
-    group:  []const []const u8  = &.{},
-    /// Optional HAVING clause (raw SQL fragment).
-    having: ?[]const u8         = null,
-    /// If true, emits SELECT DISTINCT.
-    distinct: bool              = false,
+    table:    []const u8         = "",
+    cols:     []const []const u8 = &.{},
+    where:    ?[]const u8        = null,
+    order:    []const Order      = &.{},
+    limit:    ?usize             = null,
+    offset:   ?usize             = null,
+    joins:    []const []const u8 = &.{},
+    group:    []const []const u8 = &.{},
+    having:   ?[]const u8        = null,
+    distinct: bool               = false,
 };
 
-/// Builds a SELECT statement. Caller owns the returned slice.
-pub fn select(allocator: std.mem.Allocator, config: SelectConfig) ![]const u8 {
-    var buf = std.ArrayList(u8).init(allocator);
-    errdefer buf.deinit();
+pub fn select(gpa: Allocator, cfg: SelectConfig) ![]u8 {
+    return renderOwned(gpa, cfg, writeSelect);
+}
 
-    try buf.appendSlice("SELECT ");
-    if (config.distinct) try buf.appendSlice("DISTINCT ");
+pub fn writeSelect(w: *Writer, cfg: SelectConfig) Writer.Error!void {
+    try w.writeAll("SELECT ");
+    if (cfg.distinct) try w.writeAll("DISTINCT ");
+    if (cfg.cols.len == 0) try w.writeByte('*') else try writeList(w, cfg.cols);
+    try w.print(" FROM {s}", .{cfg.table});
 
-    // Columns
-    if (config.cols.len == 0) {
-        try buf.append('*');
-    } else {
-        for (config.cols, 0..) |col, i| {
-            if (i > 0) try buf.appendSlice(", ");
-            try buf.appendSlice(col);
+    for (cfg.joins) |j| try w.print(" {s}", .{j});
+    if (cfg.where)  |x| try w.print(" WHERE {s}", .{x});
+
+    if (cfg.group.len > 0) {
+        try w.writeAll(" GROUP BY ");
+        try writeList(w, cfg.group);
+    }
+    if (cfg.having) |x| try w.print(" HAVING {s}", .{x});
+
+    if (cfg.order.len > 0) {
+        try w.writeAll(" ORDER BY ");
+        for (cfg.order, 0..) |t, i| {
+            if (i > 0) try w.writeAll(", ");
+            try w.writeAll(t.col);
+            try w.writeAll(if (t.dir == .asc) " ASC" else " DESC");
         }
     }
 
-    // FROM
-    try buf.appendSlice(" FROM ");
-    try buf.appendSlice(config.table);
+    if (cfg.limit)  |x| try w.print(" LIMIT {d}",  .{x});
+    if (cfg.offset) |x| try w.print(" OFFSET {d}", .{x});
+}
 
-    // JOINs
-    for (config.joins) |join| {
-        try buf.append(' ');
-        try buf.appendSlice(join);
-    }
+test "select *" {
+    const sql = try select(testing.allocator, .{ .table = "users" });
+    defer testing.allocator.free(sql);
+    try testing.expectEqualStrings("SELECT * FROM users", sql);
+}
 
-    // WHERE
-    if (config.where) |w| {
-        try buf.appendSlice(" WHERE ");
-        try buf.appendSlice(w);
-    }
+test "select columns" {
+    const sql = try select(testing.allocator, .{
+        .table = "users",
+        .cols  = &.{ "id", "name", "email" },
+    });
+    defer testing.allocator.free(sql);
+    try testing.expectEqualStrings("SELECT id, name, email FROM users", sql);
+}
 
-    // GROUP BY
-    if (config.group.len > 0) {
-        try buf.appendSlice(" GROUP BY ");
-        for (config.group, 0..) |col, i| {
-            if (i > 0) try buf.appendSlice(", ");
-            try buf.appendSlice(col);
-        }
-    }
+test "select with where" {
+    const sql = try select(testing.allocator, .{
+        .table = "users",
+        .cols  = &.{ "id", "name" },
+        .where = "active = 1",
+    });
+    defer testing.allocator.free(sql);
+    try testing.expectEqualStrings("SELECT id, name FROM users WHERE active = 1", sql);
+}
 
-    // HAVING
-    if (config.having) |h| {
-        try buf.appendSlice(" HAVING ");
-        try buf.appendSlice(h);
-    }
+test "select with limit and offset" {
+    const sql = try select(testing.allocator, .{
+        .table  = "users",
+        .limit  = 10,
+        .offset = 20,
+    });
+    defer testing.allocator.free(sql);
+    try testing.expectEqualStrings("SELECT * FROM users LIMIT 10 OFFSET 20", sql);
+}
 
-    // ORDER BY
-    if (config.order.len > 0) {
-        try buf.appendSlice(" ORDER BY ");
-        for (config.order, 0..) |term, i| {
-            if (i > 0) try buf.appendSlice(", ");
-            try buf.appendSlice(term.col);
-            try buf.append(' ');
-            try buf.appendSlice(term.dir.toString());
-        }
-    }
+test "select with order by" {
+    const sql = try select(testing.allocator, .{
+        .table = "users",
+        .order = &.{
+            .{ .col = "name",       .dir = .asc },
+            .{ .col = "created_at", .dir = .desc },
+        },
+    });
+    defer testing.allocator.free(sql);
+    try testing.expectEqualStrings(
+        "SELECT * FROM users ORDER BY name ASC, created_at DESC",
+        sql,
+    );
+}
 
-    // LIMIT
-    if (config.limit) |l| {
-        const s = try std.fmt.allocPrint(allocator, " LIMIT {d}", .{l});
-        defer allocator.free(s);
-        try buf.appendSlice(s);
-    }
+test "select distinct" {
+    const sql = try select(testing.allocator, .{
+        .table    = "users",
+        .cols     = &.{"country"},
+        .distinct = true,
+    });
+    defer testing.allocator.free(sql);
+    try testing.expectEqualStrings("SELECT DISTINCT country FROM users", sql);
+}
 
-    // OFFSET
-    if (config.offset) |o| {
-        const s = try std.fmt.allocPrint(allocator, " OFFSET {d}", .{o});
-        defer allocator.free(s);
-        try buf.appendSlice(s);
-    }
+test "select with join" {
+    const sql = try select(testing.allocator, .{
+        .table = "users",
+        .cols  = &.{ "users.id", "orders.total" },
+        .joins = &.{"INNER JOIN orders ON orders.user_id = users.id"},
+        .where = "users.active = 1",
+    });
+    defer testing.allocator.free(sql);
+    try testing.expectEqualStrings(
+        "SELECT users.id, orders.total FROM users " ++
+        "INNER JOIN orders ON orders.user_id = users.id " ++
+        "WHERE users.active = 1",
+        sql,
+    );
+}
 
-    return buf.toOwnedSlice();
+test "select with group by and having" {
+    const sql = try select(testing.allocator, .{
+        .table  = "orders",
+        .cols   = &.{ "user_id", "COUNT(*) as total" },
+        .group  = &.{"user_id"},
+        .having = "COUNT(*) > 5",
+    });
+    defer testing.allocator.free(sql);
+    try testing.expectEqualStrings(
+        "SELECT user_id, COUNT(*) as total FROM orders " ++
+        "GROUP BY user_id HAVING COUNT(*) > 5",
+        sql,
+    );
+}
+
+test "select full" {
+    const sql = try select(testing.allocator, .{
+        .table  = "users",
+        .cols   = &.{ "id", "name", "email" },
+        .where  = "active = 1",
+        .order  = &.{.{ .col = "name", .dir = .asc }},
+        .limit  = 50,
+        .offset = 0,
+    });
+    defer testing.allocator.free(sql);
+    try testing.expectEqualStrings(
+        "SELECT id, name, email FROM users WHERE active = 1 ORDER BY name ASC LIMIT 50 OFFSET 0",
+        sql,
+    );
 }
 
 // ── INSERT ────────────────────────────────────────────────────────────────────
 
 pub const InsertConfig = struct {
-    /// Table to insert into. Required.
     table:  []const u8         = "",
-    /// Column names. Must match values in length.
     cols:   []const []const u8 = &.{},
-    /// Values as SQL literals (e.g. "'eugene'", "1", "NULL").
     values: []const []const u8 = &.{},
-    /// If true, emits INSERT OR REPLACE (SQLite upsert).
-    replace: bool              = false,
-    /// If true, emits INSERT OR IGNORE (SQLite ignore on conflict).
-    ignore:  bool              = false,
 };
 
-/// Builds an INSERT statement. Caller owns the returned slice.
-pub fn insert(allocator: std.mem.Allocator, config: InsertConfig) ![]const u8 {
-    if (config.cols.len != config.values.len) return error.ColsValuesMismatch;
+pub fn insert(gpa: Allocator, cfg: InsertConfig) ![]u8 {
+    return renderOwned(gpa, cfg, writeInsert);
+}
 
-    var buf = std.ArrayList(u8).init(allocator);
-    errdefer buf.deinit();
+pub fn writeInsert(w: *Writer, cfg: InsertConfig) (Writer.Error || error{ColsValuesMismatch})!void {
+    if (cfg.cols.len != cfg.values.len) return error.ColsValuesMismatch;
 
-    if (config.replace) {
-        try buf.appendSlice("INSERT OR REPLACE INTO ");
-    } else if (config.ignore) {
-        try buf.appendSlice("INSERT OR IGNORE INTO ");
-    } else {
-        try buf.appendSlice("INSERT INTO ");
-    }
+    try w.print("INSERT INTO {s} (", .{cfg.table});
+    try writeList(w, cfg.cols);
+    try w.writeAll(") VALUES (");
+    try writeList(w, cfg.values);
+    try w.writeByte(')');
+}
 
-    try buf.appendSlice(config.table);
+test "insert" {
+    const sql = try insert(testing.allocator, .{
+        .table  = "users",
+        .cols   = &.{ "name", "email" },
+        .values = &.{ "'Eugene'", "'eugene@pindo.io'" },
+    });
+    defer testing.allocator.free(sql);
+    try testing.expectEqualStrings(
+        "INSERT INTO users (name, email) VALUES ('Eugene', 'eugene@pindo.io')",
+        sql,
+    );
+}
 
-    // Columns
-    try buf.appendSlice(" (");
-    for (config.cols, 0..) |col, i| {
-        if (i > 0) try buf.appendSlice(", ");
-        try buf.appendSlice(col);
-    }
-    try buf.append(')');
-
-    // Values
-    try buf.appendSlice(" VALUES (");
-    for (config.values, 0..) |val, i| {
-        if (i > 0) try buf.appendSlice(", ");
-        try buf.appendSlice(val);
-    }
-    try buf.append(')');
-
-    return buf.toOwnedSlice();
+test "insert cols values mismatch returns error" {
+    try testing.expectError(error.ColsValuesMismatch, insert(testing.allocator, .{
+        .table  = "users",
+        .cols   = &.{ "name", "email" },
+        .values = &.{"'Eugene'"},
+    }));
 }
 
 // ── INSERT MANY ───────────────────────────────────────────────────────────────
 
 pub const InsertManyConfig = struct {
-    /// Table to insert into. Required.
-    table:   []const u8              = "",
-    /// Column names. Required.
-    cols:    []const []const u8      = &.{},
-    /// Rows of values. Each row must match cols in length.
-    rows:    []const []const []const u8 = &.{},
-    /// If true, emits INSERT OR REPLACE.
-    replace: bool                    = false,
-    /// If true, emits INSERT OR IGNORE.
-    ignore:  bool                    = false,
+    table: []const u8                 = "",
+    cols:  []const []const u8         = &.{},
+    rows:  []const []const []const u8 = &.{},
 };
 
-/// Builds a multi-row INSERT statement. Caller owns the returned slice.
-pub fn insertMany(allocator: std.mem.Allocator, config: InsertManyConfig) ![]const u8 {
-    if (config.rows.len == 0) return error.NoRows;
-    for (config.rows) |row| {
-        if (row.len != config.cols.len) return error.ColsValuesMismatch;
+pub fn insertMany(gpa: Allocator, cfg: InsertManyConfig) ![]u8 {
+    return renderOwned(gpa, cfg, writeInsertMany);
+}
+
+pub fn writeInsertMany(w: *Writer, cfg: InsertManyConfig) (Writer.Error || error{ NoRows, ColsValuesMismatch })!void {
+    if (cfg.rows.len == 0) return error.NoRows;
+    for (cfg.rows) |row| if (row.len != cfg.cols.len) return error.ColsValuesMismatch;
+
+    try w.print("INSERT INTO {s} (", .{cfg.table});
+    try writeList(w, cfg.cols);
+    try w.writeAll(") VALUES ");
+
+    for (cfg.rows, 0..) |row, i| {
+        if (i > 0) try w.writeAll(", ");
+        try w.writeByte('(');
+        try writeList(w, row);
+        try w.writeByte(')');
     }
+}
 
-    var buf = std.ArrayList(u8).init(allocator);
-    errdefer buf.deinit();
+test "insert many" {
+    const sql = try insertMany(testing.allocator, .{
+        .table = "users",
+        .cols  = &.{ "name", "email" },
+        .rows  = &.{
+            &.{ "'Eugene'", "'eugene@pindo.io'" },
+            &.{ "'Alice'",  "'alice@example.com'" },
+        },
+    });
+    defer testing.allocator.free(sql);
+    try testing.expectEqualStrings(
+        "INSERT INTO users (name, email) VALUES ('Eugene', 'eugene@pindo.io'), ('Alice', 'alice@example.com')",
+        sql,
+    );
+}
 
-    if (config.replace) {
-        try buf.appendSlice("INSERT OR REPLACE INTO ");
-    } else if (config.ignore) {
-        try buf.appendSlice("INSERT OR IGNORE INTO ");
-    } else {
-        try buf.appendSlice("INSERT INTO ");
-    }
-
-    try buf.appendSlice(config.table);
-
-    // Columns
-    try buf.appendSlice(" (");
-    for (config.cols, 0..) |col, i| {
-        if (i > 0) try buf.appendSlice(", ");
-        try buf.appendSlice(col);
-    }
-    try buf.appendSlice(") VALUES ");
-
-    // Rows
-    for (config.rows, 0..) |row, ri| {
-        if (ri > 0) try buf.appendSlice(", ");
-        try buf.append('(');
-        for (row, 0..) |val, vi| {
-            if (vi > 0) try buf.appendSlice(", ");
-            try buf.appendSlice(val);
-        }
-        try buf.append(')');
-    }
-
-    return buf.toOwnedSlice();
+test "insert many no rows returns error" {
+    try testing.expectError(error.NoRows, insertMany(testing.allocator, .{
+        .table = "users",
+        .cols  = &.{"name"},
+        .rows  = &.{},
+    }));
 }
 
 // ── UPDATE ────────────────────────────────────────────────────────────────────
 
 pub const UpdateConfig = struct {
-    /// Table to update. Required.
     table: []const u8         = "",
-    /// SET assignments as raw SQL fragments (e.g. "name = 'eugene'").
     set:   []const []const u8 = &.{},
-    /// Optional WHERE clause. Omitting updates all rows.
     where: ?[]const u8        = null,
 };
 
-/// Builds an UPDATE statement. Caller owns the returned slice.
-pub fn update(allocator: std.mem.Allocator, config: UpdateConfig) ![]const u8 {
-    if (config.set.len == 0) return error.NoSetClauses;
+pub fn update(gpa: Allocator, cfg: UpdateConfig) ![]u8 {
+    return renderOwned(gpa, cfg, writeUpdate);
+}
 
-    var buf = std.ArrayList(u8).init(allocator);
-    errdefer buf.deinit();
+pub fn writeUpdate(w: *Writer, cfg: UpdateConfig) (Writer.Error || error{NoSetClauses})!void {
+    if (cfg.set.len == 0) return error.NoSetClauses;
 
-    try buf.appendSlice("UPDATE ");
-    try buf.appendSlice(config.table);
-    try buf.appendSlice(" SET ");
+    try w.print("UPDATE {s} SET ", .{cfg.table});
+    try writeList(w, cfg.set);
+    if (cfg.where) |x| try w.print(" WHERE {s}", .{x});
+}
 
-    for (config.set, 0..) |assignment, i| {
-        if (i > 0) try buf.appendSlice(", ");
-        try buf.appendSlice(assignment);
-    }
+test "update" {
+    const sql = try update(testing.allocator, .{
+        .table = "users",
+        .set   = &.{ "name = 'Eugene'", "active = 1" },
+        .where = "id = 1",
+    });
+    defer testing.allocator.free(sql);
+    try testing.expectEqualStrings(
+        "UPDATE users SET name = 'Eugene', active = 1 WHERE id = 1",
+        sql,
+    );
+}
 
-    if (config.where) |w| {
-        try buf.appendSlice(" WHERE ");
-        try buf.appendSlice(w);
-    }
+test "update without where updates all rows" {
+    const sql = try update(testing.allocator, .{
+        .table = "users",
+        .set   = &.{"active = 0"},
+    });
+    defer testing.allocator.free(sql);
+    try testing.expectEqualStrings("UPDATE users SET active = 0", sql);
+}
 
-    return buf.toOwnedSlice();
+test "update no set clauses returns error" {
+    try testing.expectError(error.NoSetClauses, update(testing.allocator, .{
+        .table = "users",
+        .set   = &.{},
+        .where = "id = 1",
+    }));
 }
 
 // ── DELETE ────────────────────────────────────────────────────────────────────
 
 pub const DeleteConfig = struct {
-    /// Table to delete from. Required.
     table: []const u8  = "",
-    /// Optional WHERE clause. Omitting deletes all rows.
     where: ?[]const u8 = null,
 };
 
-/// Builds a DELETE statement. Caller owns the returned slice.
-pub fn delete(allocator: std.mem.Allocator, config: DeleteConfig) ![]const u8 {
-    var buf = std.ArrayList(u8).init(allocator);
-    errdefer buf.deinit();
+pub fn delete(gpa: Allocator, cfg: DeleteConfig) ![]u8 {
+    return renderOwned(gpa, cfg, writeDelete);
+}
 
-    try buf.appendSlice("DELETE FROM ");
-    try buf.appendSlice(config.table);
+pub fn writeDelete(w: *Writer, cfg: DeleteConfig) Writer.Error!void {
+    try w.print("DELETE FROM {s}", .{cfg.table});
+    if (cfg.where) |x| try w.print(" WHERE {s}", .{x});
+}
 
-    if (config.where) |w| {
-        try buf.appendSlice(" WHERE ");
-        try buf.appendSlice(w);
-    }
+test "delete with where" {
+    const sql = try delete(testing.allocator, .{
+        .table = "users",
+        .where = "id = 1",
+    });
+    defer testing.allocator.free(sql);
+    try testing.expectEqualStrings("DELETE FROM users WHERE id = 1", sql);
+}
 
-    return buf.toOwnedSlice();
+test "delete all rows" {
+    const sql = try delete(testing.allocator, .{ .table = "users" });
+    defer testing.allocator.free(sql);
+    try testing.expectEqualStrings("DELETE FROM users", sql);
 }
 
 // ── CREATE TABLE ──────────────────────────────────────────────────────────────
 
-pub const ColumnDef = struct {
-    name:       []const u8,
-    type:       []const u8,
-    /// Optional constraints e.g. "NOT NULL", "PRIMARY KEY AUTOINCREMENT".
-    constraints: []const u8 = "",
-};
-
 pub const CreateTableConfig = struct {
-    /// Table name. Required.
-    table:       []const u8       = "",
-    /// Column definitions.
-    cols:        []const ColumnDef = &.{},
-    /// If true, emits CREATE TABLE IF NOT EXISTS.
+    table:         []const u8     = "",
+    cols:          []const Column = &.{},
     if_not_exists: bool           = false,
 };
 
-/// Builds a CREATE TABLE statement. Caller owns the returned slice.
-pub fn createTable(allocator: std.mem.Allocator, config: CreateTableConfig) ![]const u8 {
-    if (config.cols.len == 0) return error.NoColumns;
+pub fn createTable(gpa: Allocator, cfg: CreateTableConfig) ![]u8 {
+    return renderOwned(gpa, cfg, writeCreateTable);
+}
 
-    var buf = std.ArrayList(u8).init(allocator);
-    errdefer buf.deinit();
+pub fn writeCreateTable(w: *Writer, cfg: CreateTableConfig) (Writer.Error || error{NoColumns})!void {
+    if (cfg.cols.len == 0) return error.NoColumns;
 
-    if (config.if_not_exists) {
-        try buf.appendSlice("CREATE TABLE IF NOT EXISTS ");
-    } else {
-        try buf.appendSlice("CREATE TABLE ");
+    try w.writeAll(if (cfg.if_not_exists) "CREATE TABLE IF NOT EXISTS " else "CREATE TABLE ");
+    try w.print("{s} (", .{cfg.table});
+
+    for (cfg.cols, 0..) |c, i| {
+        if (i > 0) try w.writeAll(", ");
+        try w.print("{s} {s}", .{ c.name, c.type });
+        if (c.constraints.len > 0) try w.print(" {s}", .{c.constraints});
     }
+    try w.writeByte(')');
+}
 
-    try buf.appendSlice(config.table);
-    try buf.appendSlice(" (");
+test "create table" {
+    const sql = try createTable(testing.allocator, .{
+        .table = "users",
+        .cols  = &.{
+            .{ .name = "id",    .type = "INTEGER", .constraints = "PRIMARY KEY AUTOINCREMENT" },
+            .{ .name = "name",  .type = "TEXT",    .constraints = "NOT NULL" },
+            .{ .name = "email", .type = "TEXT",    .constraints = "NOT NULL UNIQUE" },
+        },
+    });
+    defer testing.allocator.free(sql);
+    try testing.expectEqualStrings(
+        "CREATE TABLE users (" ++
+        "id INTEGER PRIMARY KEY AUTOINCREMENT, " ++
+        "name TEXT NOT NULL, " ++
+        "email TEXT NOT NULL UNIQUE)",
+        sql,
+    );
+}
 
-    for (config.cols, 0..) |col, i| {
-        if (i > 0) try buf.appendSlice(", ");
-        try buf.appendSlice(col.name);
-        try buf.append(' ');
-        try buf.appendSlice(col.type);
-        if (col.constraints.len > 0) {
-            try buf.append(' ');
-            try buf.appendSlice(col.constraints);
-        }
-    }
-
-    try buf.append(')');
-
-    return buf.toOwnedSlice();
+test "create table if not exists" {
+    const sql = try createTable(testing.allocator, .{
+        .table         = "users",
+        .if_not_exists = true,
+        .cols          = &.{.{ .name = "id", .type = "INTEGER" }},
+    });
+    defer testing.allocator.free(sql);
+    try testing.expectEqualStrings("CREATE TABLE IF NOT EXISTS users (id INTEGER)", sql);
 }
 
 // ── DROP TABLE ────────────────────────────────────────────────────────────────
 
 pub const DropTableConfig = struct {
-    /// Table name. Required.
-    table:    []const u8 = "",
-    /// If true, emits DROP TABLE IF EXISTS.
-    if_exists: bool      = false,
+    table:     []const u8 = "",
+    if_exists: bool       = false,
 };
 
-/// Builds a DROP TABLE statement. Caller owns the returned slice.
-pub fn dropTable(allocator: std.mem.Allocator, config: DropTableConfig) ![]const u8 {
-    var buf = std.ArrayList(u8).init(allocator);
-    errdefer buf.deinit();
+pub fn dropTable(gpa: Allocator, cfg: DropTableConfig) ![]u8 {
+    return renderOwned(gpa, cfg, writeDropTable);
+}
 
-    if (config.if_exists) {
-        try buf.appendSlice("DROP TABLE IF EXISTS ");
-    } else {
-        try buf.appendSlice("DROP TABLE ");
-    }
+pub fn writeDropTable(w: *Writer, cfg: DropTableConfig) Writer.Error!void {
+    try w.writeAll(if (cfg.if_exists) "DROP TABLE IF EXISTS " else "DROP TABLE ");
+    try w.writeAll(cfg.table);
+}
 
-    try buf.appendSlice(config.table);
+test "drop table" {
+    const sql = try dropTable(testing.allocator, .{ .table = "users" });
+    defer testing.allocator.free(sql);
+    try testing.expectEqualStrings("DROP TABLE users", sql);
+}
 
-    return buf.toOwnedSlice();
+test "drop table if exists" {
+    const sql = try dropTable(testing.allocator, .{
+        .table     = "users",
+        .if_exists = true,
+    });
+    defer testing.allocator.free(sql);
+    try testing.expectEqualStrings("DROP TABLE IF EXISTS users", sql);
 }
 
 // ── CREATE INDEX ──────────────────────────────────────────────────────────────
 
 pub const CreateIndexConfig = struct {
-    /// Index name. Required.
-    name:         []const u8        = "",
-    /// Table to index. Required.
-    table:        []const u8        = "",
-    /// Columns to index. Required.
-    cols:         []const []const u8 = &.{},
-    /// If true, emits CREATE UNIQUE INDEX.
-    unique:       bool              = false,
-    /// If true, emits CREATE INDEX IF NOT EXISTS.
-    if_not_exists: bool             = false,
+    name:          []const u8         = "",
+    table:         []const u8         = "",
+    cols:          []const []const u8 = &.{},
+    unique:        bool               = false,
+    if_not_exists: bool               = false,
 };
 
-/// Builds a CREATE INDEX statement. Caller owns the returned slice.
-pub fn createIndex(allocator: std.mem.Allocator, config: CreateIndexConfig) ![]const u8 {
-    if (config.cols.len == 0) return error.NoColumns;
+pub fn createIndex(gpa: Allocator, cfg: CreateIndexConfig) ![]u8 {
+    return renderOwned(gpa, cfg, writeCreateIndex);
+}
 
-    var buf = std.ArrayList(u8).init(allocator);
-    errdefer buf.deinit();
+pub fn writeCreateIndex(w: *Writer, cfg: CreateIndexConfig) (Writer.Error || error{NoColumns})!void {
+    if (cfg.cols.len == 0) return error.NoColumns;
 
-    try buf.appendSlice("CREATE ");
-    if (config.unique) try buf.appendSlice("UNIQUE ");
-    try buf.appendSlice("INDEX ");
-    if (config.if_not_exists) try buf.appendSlice("IF NOT EXISTS ");
-    try buf.appendSlice(config.name);
-    try buf.appendSlice(" ON ");
-    try buf.appendSlice(config.table);
-    try buf.appendSlice(" (");
+    try w.writeAll("CREATE ");
+    if (cfg.unique)        try w.writeAll("UNIQUE ");
+    try w.writeAll("INDEX ");
+    if (cfg.if_not_exists) try w.writeAll("IF NOT EXISTS ");
+    try w.print("{s} ON {s} (", .{ cfg.name, cfg.table });
+    try writeList(w, cfg.cols);
+    try w.writeByte(')');
+}
 
-    for (config.cols, 0..) |col, i| {
-        if (i > 0) try buf.appendSlice(", ");
-        try buf.appendSlice(col);
-    }
+test "create index" {
+    const sql = try createIndex(testing.allocator, .{
+        .name  = "idx_users_email",
+        .table = "users",
+        .cols  = &.{"email"},
+    });
+    defer testing.allocator.free(sql);
+    try testing.expectEqualStrings("CREATE INDEX idx_users_email ON users (email)", sql);
+}
 
-    try buf.append(')');
-
-    return buf.toOwnedSlice();
+test "create unique index if not exists" {
+    const sql = try createIndex(testing.allocator, .{
+        .name          = "idx_users_email",
+        .table         = "users",
+        .cols          = &.{"email"},
+        .unique        = true,
+        .if_not_exists = true,
+    });
+    defer testing.allocator.free(sql);
+    try testing.expectEqualStrings(
+        "CREATE UNIQUE INDEX IF NOT EXISTS idx_users_email ON users (email)",
+        sql,
+    );
 }
 
 // ── WHERE helpers ─────────────────────────────────────────────────────────────
 //
-// Utilities for building WHERE clause strings before passing them
-// to select/update/delete. All return caller-owned slices.
+// Composable fragment builders. Each returns a caller-owned slice; pass results
+// to `.where`/`.having` or compose with `all`/`any`/`group`/`not`.
 
-/// Joins conditions with AND.
-///   where.all(allocator, &.{ "active = 1", "age > 18" })
-///   → "active = 1 AND age > 18"
-pub fn all(allocator: std.mem.Allocator, conditions: []const []const u8) ![]const u8 {
-    return std.mem.join(allocator, " AND ", conditions);
+pub fn all(gpa: Allocator, conditions: []const []const u8) ![]u8 {
+    return std.mem.join(gpa, " AND ", conditions);
 }
 
-/// Joins conditions with OR.
-///   where.any(allocator, &.{ "role = 'admin'", "role = 'mod'" })
-///   → "role = 'admin' OR role = 'mod'"
-pub fn any(allocator: std.mem.Allocator, conditions: []const []const u8) ![]const u8 {
-    return std.mem.join(allocator, " OR ", conditions);
+pub fn any(gpa: Allocator, conditions: []const []const u8) ![]u8 {
+    return std.mem.join(gpa, " OR ", conditions);
 }
 
-/// Wraps a condition in parentheses.
-///   where.group(allocator, "a = 1 OR b = 2")
-///   → "(a = 1 OR b = 2)"
-pub fn group(allocator: std.mem.Allocator, condition: []const u8) ![]const u8 {
-    return std.fmt.allocPrint(allocator, "({s})", .{condition});
+pub fn group(gpa: Allocator, condition: []const u8) ![]u8 {
+    return std.fmt.allocPrint(gpa, "({s})", .{condition});
 }
 
-/// Builds a NOT condition.
-///   where.not(allocator, "active = 1")
-///   → "NOT (active = 1)"
-pub fn not(allocator: std.mem.Allocator, condition: []const u8) ![]const u8 {
-    return std.fmt.allocPrint(allocator, "NOT ({s})", .{condition});
+pub fn not(gpa: Allocator, condition: []const u8) ![]u8 {
+    return std.fmt.allocPrint(gpa, "NOT ({s})", .{condition});
 }
 
-/// Builds col IN (v1, v2, ...).
-///   where.in(allocator, "id", &.{ "1", "2", "3" })
-///   → "id IN (1, 2, 3)"
-pub fn in(allocator: std.mem.Allocator, col: []const u8, values: []const []const u8) ![]const u8 {
-    const joined = try std.mem.join(allocator, ", ", values);
-    defer allocator.free(joined);
-    return std.fmt.allocPrint(allocator, "{s} IN ({s})", .{ col, joined });
+pub fn in(gpa: Allocator, col: []const u8, values: []const []const u8) ![]u8 {
+    return renderOwned(gpa, InCtx{ .col = col, .op = "IN", .values = values }, writeIn);
 }
 
-/// Builds col NOT IN (v1, v2, ...).
-pub fn notIn(allocator: std.mem.Allocator, col: []const u8, values: []const []const u8) ![]const u8 {
-    const joined = try std.mem.join(allocator, ", ", values);
-    defer allocator.free(joined);
-    return std.fmt.allocPrint(allocator, "{s} NOT IN ({s})", .{ col, joined });
+pub fn notIn(gpa: Allocator, col: []const u8, values: []const []const u8) ![]u8 {
+    return renderOwned(gpa, InCtx{ .col = col, .op = "NOT IN", .values = values }, writeIn);
 }
 
-/// Builds col BETWEEN low AND high.
-pub fn between(allocator: std.mem.Allocator, col: []const u8, low: []const u8, high: []const u8) ![]const u8 {
-    return std.fmt.allocPrint(allocator, "{s} BETWEEN {s} AND {s}", .{ col, low, high });
+const InCtx = struct {
+    col:    []const u8,
+    op:     []const u8,
+    values: []const []const u8,
+};
+
+fn writeIn(w: *Writer, ctx: InCtx) Writer.Error!void {
+    try w.print("{s} {s} (", .{ ctx.col, ctx.op });
+    try writeList(w, ctx.values);
+    try w.writeByte(')');
 }
 
-/// Builds col IS NULL.
-pub fn isNull(allocator: std.mem.Allocator, col: []const u8) ![]const u8 {
-    return std.fmt.allocPrint(allocator, "{s} IS NULL", .{col});
+pub fn between(gpa: Allocator, col: []const u8, low: []const u8, high: []const u8) ![]u8 {
+    return std.fmt.allocPrint(gpa, "{s} BETWEEN {s} AND {s}", .{ col, low, high });
 }
 
-/// Builds col IS NOT NULL.
-pub fn isNotNull(allocator: std.mem.Allocator, col: []const u8) ![]const u8 {
-    return std.fmt.allocPrint(allocator, "{s} IS NOT NULL", .{col});
+/// `betweenDates` is like `between` but quotes the values — handy for ISO8601
+/// timestamps that the caller has not pre-quoted.
+pub fn betweenDates(gpa: Allocator, col: []const u8, from: []const u8, to: []const u8) ![]u8 {
+    return std.fmt.allocPrint(gpa, "{s} BETWEEN '{s}' AND '{s}'", .{ col, from, to });
 }
 
-/// Builds col LIKE pattern.
-pub fn like(allocator: std.mem.Allocator, col: []const u8, pattern: []const u8) ![]const u8 {
-    return std.fmt.allocPrint(allocator, "{s} LIKE '{s}'", .{ col, pattern });
+pub fn isNull(gpa: Allocator, col: []const u8) ![]u8 {
+    return std.fmt.allocPrint(gpa, "{s} IS NULL", .{col});
 }
 
-/// Builds col BETWEEN 'low' AND 'high' with quoted datetime strings.
-///   zql.betweenDates(a, "created_at", "2026-03-01 00:00:00", "2026-04-01 00:00:00")
-///   → "created_at BETWEEN '2026-03-01 00:00:00' AND '2026-04-01 00:00:00'"
-pub fn betweenDates(
-    allocator: std.mem.Allocator,
-    col:       []const u8,
-    from:      []const u8,
-    to:        []const u8,
-) ![]const u8 {
-    return std.fmt.allocPrint(
-        allocator,
-        "{s} BETWEEN '{s}' AND '{s}'",
-        .{ col, from, to },
+pub fn isNotNull(gpa: Allocator, col: []const u8) ![]u8 {
+    return std.fmt.allocPrint(gpa, "{s} IS NOT NULL", .{col});
+}
+
+pub fn like(gpa: Allocator, col: []const u8, pattern: []const u8) ![]u8 {
+    return std.fmt.allocPrint(gpa, "{s} LIKE '{s}'", .{ col, pattern });
+}
+
+test "where all" {
+    const w = try all(testing.allocator, &.{ "active = 1", "age > 18" });
+    defer testing.allocator.free(w);
+    try testing.expectEqualStrings("active = 1 AND age > 18", w);
+}
+
+test "where any" {
+    const w = try any(testing.allocator, &.{ "role = 'admin'", "role = 'mod'" });
+    defer testing.allocator.free(w);
+    try testing.expectEqualStrings("role = 'admin' OR role = 'mod'", w);
+}
+
+test "where group" {
+    const w = try group(testing.allocator, "a = 1 OR b = 2");
+    defer testing.allocator.free(w);
+    try testing.expectEqualStrings("(a = 1 OR b = 2)", w);
+}
+
+test "where not" {
+    const w = try not(testing.allocator, "active = 1");
+    defer testing.allocator.free(w);
+    try testing.expectEqualStrings("NOT (active = 1)", w);
+}
+
+test "where in" {
+    const w = try in(testing.allocator, "id", &.{ "1", "2", "3" });
+    defer testing.allocator.free(w);
+    try testing.expectEqualStrings("id IN (1, 2, 3)", w);
+}
+
+test "where not in" {
+    const w = try notIn(testing.allocator, "id", &.{ "1", "2" });
+    defer testing.allocator.free(w);
+    try testing.expectEqualStrings("id NOT IN (1, 2)", w);
+}
+
+test "where between" {
+    const w = try between(testing.allocator, "age", "18", "65");
+    defer testing.allocator.free(w);
+    try testing.expectEqualStrings("age BETWEEN 18 AND 65", w);
+}
+
+test "where is null" {
+    const w = try isNull(testing.allocator, "deleted_at");
+    defer testing.allocator.free(w);
+    try testing.expectEqualStrings("deleted_at IS NULL", w);
+}
+
+test "where is not null" {
+    const w = try isNotNull(testing.allocator, "email");
+    defer testing.allocator.free(w);
+    try testing.expectEqualStrings("email IS NOT NULL", w);
+}
+
+test "where like" {
+    const w = try like(testing.allocator, "name", "Eug%");
+    defer testing.allocator.free(w);
+    try testing.expectEqualStrings("name LIKE 'Eug%'", w);
+}
+
+test "betweenDates" {
+    const w = try betweenDates(
+        testing.allocator,
+        "sms.created_at",
+        "2026-03-01 00:00:00",
+        "2026-04-01 00:00:00",
+    );
+    defer testing.allocator.free(w);
+    try testing.expectEqualStrings(
+        "sms.created_at BETWEEN '2026-03-01 00:00:00' AND '2026-04-01 00:00:00'",
+        w,
     );
 }
 
-// ── Aggregate functions ───────────────────────────────────────────────────────
+test "compose where with all and any" {
+    const a = testing.allocator;
+    const roles   = try any(a, &.{ "role = 'admin'", "role = 'mod'" });
+    defer a.free(roles);
+    const grouped = try group(a, roles);
+    defer a.free(grouped);
+    const w       = try all(a, &.{ grouped, "active = 1" });
+    defer a.free(w);
+
+    const sql = try select(a, .{ .table = "users", .where = w });
+    defer a.free(sql);
+
+    try testing.expectEqualStrings(
+        "SELECT * FROM users WHERE (role = 'admin' OR role = 'mod') AND active = 1",
+        sql,
+    );
+}
+
+// ── Aggregate / scalar functions ──────────────────────────────────────────────
 //
-// Two functions per aggregate: bare and aliased.
-// Bare:    try zql.sum(a, "amount")            → "SUM(amount)"
-// Aliased: try zql.sumAs(a, "amount", "total") → "SUM(amount) AS total"
-// All return caller-owned slices.
+// Two variants per function: bare (`SUM(col)`) and aliased (`SUM(col) AS x`).
 
-// Internal helper — not exported.
-fn agg(allocator: std.mem.Allocator, func: []const u8, col: []const u8) ![]const u8 {
-    return std.fmt.allocPrint(allocator, "{s}({s})", .{ func, col });
+pub fn sum(gpa: Allocator, col: []const u8) ![]u8 {
+    return std.fmt.allocPrint(gpa, "SUM({s})", .{col});
 }
 
-fn aggAs(allocator: std.mem.Allocator, func: []const u8, col: []const u8, alias: []const u8) ![]const u8 {
-    return std.fmt.allocPrint(allocator, "{s}({s}) AS {s}", .{ func, col, alias });
+pub fn sumAs(gpa: Allocator, col: []const u8, alias: []const u8) ![]u8 {
+    return std.fmt.allocPrint(gpa, "SUM({s}) AS {s}", .{ col, alias });
 }
 
-/// SUM(col)
-///   try zql.sum(a, "amount") → "SUM(amount)"
-pub fn sum(allocator: std.mem.Allocator, col: []const u8) ![]const u8 {
-    return agg(allocator, "SUM", col);
+pub fn count(gpa: Allocator, col: []const u8) ![]u8 {
+    return std.fmt.allocPrint(gpa, "COUNT({s})", .{col});
 }
 
-/// SUM(col) AS alias
-///   try zql.sumAs(a, "amount", "total") → "SUM(amount) AS total"
-pub fn sumAs(allocator: std.mem.Allocator, col: []const u8, alias: []const u8) ![]const u8 {
-    return aggAs(allocator, "SUM", col, alias);
+pub fn countAs(gpa: Allocator, col: []const u8, alias: []const u8) ![]u8 {
+    return std.fmt.allocPrint(gpa, "COUNT({s}) AS {s}", .{ col, alias });
 }
 
-/// COUNT(col) — pass "*" for COUNT(*)
-///   try zql.count(a, "*") → "COUNT(*)"
-pub fn count(allocator: std.mem.Allocator, col: []const u8) ![]const u8 {
-    return agg(allocator, "COUNT", col);
+pub fn avg(gpa: Allocator, col: []const u8) ![]u8 {
+    return std.fmt.allocPrint(gpa, "AVG({s})", .{col});
 }
 
-/// COUNT(col) AS alias
-///   try zql.countAs(a, "*", "total") → "COUNT(*) AS total"
-pub fn countAs(allocator: std.mem.Allocator, col: []const u8, alias: []const u8) ![]const u8 {
-    return aggAs(allocator, "COUNT", col, alias);
+pub fn avgAs(gpa: Allocator, col: []const u8, alias: []const u8) ![]u8 {
+    return std.fmt.allocPrint(gpa, "AVG({s}) AS {s}", .{ col, alias });
 }
 
-/// AVG(col)
-///   try zql.avg(a, "price") → "AVG(price)"
-pub fn avg(allocator: std.mem.Allocator, col: []const u8) ![]const u8 {
-    return agg(allocator, "AVG", col);
+pub fn min(gpa: Allocator, col: []const u8) ![]u8 {
+    return std.fmt.allocPrint(gpa, "MIN({s})", .{col});
 }
 
-/// AVG(col) AS alias
-///   try zql.avgAs(a, "price", "avg_price") → "AVG(price) AS avg_price"
-pub fn avgAs(allocator: std.mem.Allocator, col: []const u8, alias: []const u8) ![]const u8 {
-    return aggAs(allocator, "AVG", col, alias);
+pub fn minAs(gpa: Allocator, col: []const u8, alias: []const u8) ![]u8 {
+    return std.fmt.allocPrint(gpa, "MIN({s}) AS {s}", .{ col, alias });
 }
 
-/// MIN(col)
-///   try zql.min(a, "price") → "MIN(price)"
-pub fn min(allocator: std.mem.Allocator, col: []const u8) ![]const u8 {
-    return agg(allocator, "MIN", col);
+pub fn max(gpa: Allocator, col: []const u8) ![]u8 {
+    return std.fmt.allocPrint(gpa, "MAX({s})", .{col});
 }
 
-/// MIN(col) AS alias
-///   try zql.minAs(a, "price", "min_price") → "MIN(price) AS min_price"
-pub fn minAs(allocator: std.mem.Allocator, col: []const u8, alias: []const u8) ![]const u8 {
-    return aggAs(allocator, "MIN", col, alias);
+pub fn maxAs(gpa: Allocator, col: []const u8, alias: []const u8) ![]u8 {
+    return std.fmt.allocPrint(gpa, "MAX({s}) AS {s}", .{ col, alias });
 }
 
-/// MAX(col)
-///   try zql.max(a, "price") → "MAX(price)"
-pub fn max(allocator: std.mem.Allocator, col: []const u8) ![]const u8 {
-    return agg(allocator, "MAX", col);
+pub fn coalesce(gpa: Allocator, col: []const u8, fallback: []const u8) ![]u8 {
+    return std.fmt.allocPrint(gpa, "COALESCE({s}, {s})", .{ col, fallback });
 }
 
-/// MAX(col) AS alias
-///   try zql.maxAs(a, "price", "max_price") → "MAX(price) AS max_price"
-pub fn maxAs(allocator: std.mem.Allocator, col: []const u8, alias: []const u8) ![]const u8 {
-    return aggAs(allocator, "MAX", col, alias);
+pub fn coalesceAs(gpa: Allocator, col: []const u8, fallback: []const u8, alias: []const u8) ![]u8 {
+    return std.fmt.allocPrint(gpa, "COALESCE({s}, {s}) AS {s}", .{ col, fallback, alias });
 }
 
-/// COALESCE(col, fallback)
-///   try zql.coalesce(a, "nickname", "'anonymous'") → "COALESCE(nickname, 'anonymous')"
-pub fn coalesce(allocator: std.mem.Allocator, col: []const u8, fallback: []const u8) ![]const u8 {
-    return std.fmt.allocPrint(allocator, "COALESCE({s}, {s})", .{ col, fallback });
+pub fn cast(gpa: Allocator, col: []const u8, as_type: []const u8) ![]u8 {
+    return std.fmt.allocPrint(gpa, "CAST({s} AS {s})", .{ col, as_type });
 }
 
-/// COALESCE(col, fallback) AS alias
-///   try zql.coalesceAs(a, "nickname", "'anonymous'", "display_name")
-///   → "COALESCE(nickname, 'anonymous') AS display_name"
-pub fn coalesceAs(allocator: std.mem.Allocator, col: []const u8, fallback: []const u8, alias: []const u8) ![]const u8 {
-    return std.fmt.allocPrint(allocator, "COALESCE({s}, {s}) AS {s}", .{ col, fallback, alias });
+pub fn castAs(gpa: Allocator, col: []const u8, as_type: []const u8, alias: []const u8) ![]u8 {
+    return std.fmt.allocPrint(gpa, "CAST({s} AS {s}) AS {s}", .{ col, as_type, alias });
 }
 
-/// CAST(col AS type)
-///   try zql.cast(a, "price", "INTEGER") → "CAST(price AS INTEGER)"
-pub fn cast(allocator: std.mem.Allocator, col: []const u8, as_type: []const u8) ![]const u8 {
-    return std.fmt.allocPrint(allocator, "CAST({s} AS {s})", .{ col, as_type });
+test "sum bare" {
+    const s = try sum(testing.allocator, "amount");
+    defer testing.allocator.free(s);
+    try testing.expectEqualStrings("SUM(amount)", s);
 }
 
-/// CAST(col AS type) AS alias
-///   try zql.castAs(a, "price", "INTEGER", "int_price") → "CAST(price AS INTEGER) AS int_price"
-pub fn castAs(allocator: std.mem.Allocator, col: []const u8, as_type: []const u8, alias: []const u8) ![]const u8 {
-    return std.fmt.allocPrint(allocator, "CAST({s} AS {s}) AS {s}", .{ col, as_type, alias });
+test "count bare" {
+    const s = try count(testing.allocator, "*");
+    defer testing.allocator.free(s);
+    try testing.expectEqualStrings("COUNT(*)", s);
+}
+
+test "avg bare" {
+    const s = try avg(testing.allocator, "price");
+    defer testing.allocator.free(s);
+    try testing.expectEqualStrings("AVG(price)", s);
+}
+
+test "min bare" {
+    const s = try min(testing.allocator, "price");
+    defer testing.allocator.free(s);
+    try testing.expectEqualStrings("MIN(price)", s);
+}
+
+test "max bare" {
+    const s = try max(testing.allocator, "price");
+    defer testing.allocator.free(s);
+    try testing.expectEqualStrings("MAX(price)", s);
+}
+
+test "coalesce bare" {
+    const s = try coalesce(testing.allocator, "nickname", "'anonymous'");
+    defer testing.allocator.free(s);
+    try testing.expectEqualStrings("COALESCE(nickname, 'anonymous')", s);
+}
+
+test "cast bare" {
+    const s = try cast(testing.allocator, "price", "INTEGER");
+    defer testing.allocator.free(s);
+    try testing.expectEqualStrings("CAST(price AS INTEGER)", s);
+}
+
+test "sumAs" {
+    const s = try sumAs(testing.allocator, "sms_item_count", "total_sms_items");
+    defer testing.allocator.free(s);
+    try testing.expectEqualStrings("SUM(sms_item_count) AS total_sms_items", s);
+}
+
+test "countAs" {
+    const s = try countAs(testing.allocator, "*", "total");
+    defer testing.allocator.free(s);
+    try testing.expectEqualStrings("COUNT(*) AS total", s);
+}
+
+test "avgAs" {
+    const s = try avgAs(testing.allocator, "price", "avg_price");
+    defer testing.allocator.free(s);
+    try testing.expectEqualStrings("AVG(price) AS avg_price", s);
+}
+
+test "minAs" {
+    const s = try minAs(testing.allocator, "price", "min_price");
+    defer testing.allocator.free(s);
+    try testing.expectEqualStrings("MIN(price) AS min_price", s);
+}
+
+test "maxAs" {
+    const s = try maxAs(testing.allocator, "price", "max_price");
+    defer testing.allocator.free(s);
+    try testing.expectEqualStrings("MAX(price) AS max_price", s);
+}
+
+test "coalesceAs" {
+    const s = try coalesceAs(testing.allocator, "nickname", "'anonymous'", "display_name");
+    defer testing.allocator.free(s);
+    try testing.expectEqualStrings("COALESCE(nickname, 'anonymous') AS display_name", s);
+}
+
+test "castAs" {
+    const s = try castAs(testing.allocator, "price", "INTEGER", "int_price");
+    defer testing.allocator.free(s);
+    try testing.expectEqualStrings("CAST(price AS INTEGER) AS int_price", s);
+}
+
+// ── Real-world integration tests ──────────────────────────────────────────────
+
+test "sms aggregation query" {
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+
+    const sql = try select(a, .{
+        .table = "sms",
+        .cols  = &.{
+            try sumAs(a, "sms_item_count", "total_sms_items"),
+            "sms.retry_count",
+        },
+        .where = try all(a, &.{
+            "account_id = '74'",
+            try betweenDates(a, "sms.created_at", "2026-03-01 00:00:00", "2026-04-01 00:00:00"),
+        }),
+        .group = &.{"retry_count"},
+    });
+
+    try testing.expectEqualStrings(
+        "SELECT SUM(sms_item_count) AS total_sms_items, sms.retry_count" ++
+        " FROM sms" ++
+        " WHERE account_id = '74'" ++
+        " AND sms.created_at BETWEEN '2026-03-01 00:00:00' AND '2026-04-01 00:00:00'" ++
+        " GROUP BY retry_count",
+        sql,
+    );
+}
+
+test "jurisdiction query" {
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+
+    const sql = try select(a, .{
+        .table = "users",
+        .cols  = &.{ "id", "name", "email" },
+        .where = try all(a, &.{ "active = 1", "jurisdiction = 'RW'" }),
+        .order = &.{.{ .col = "name", .dir = .asc }},
+        .limit = 50,
+    });
+
+    try testing.expectEqualStrings(
+        "SELECT id, name, email FROM users " ++
+        "WHERE active = 1 AND jurisdiction = 'RW' " ++
+        "ORDER BY name ASC LIMIT 50",
+        sql,
+    );
+}
+
+// ── Writer API spot check ─────────────────────────────────────────────────────
+//
+// Confirms the lower-level `writeX` functions emit identically to the allocator
+// variants when given a fixed buffer.
+
+test "writeSelect via fixed buffer" {
+    var buf: [128]u8 = undefined;
+    var w: Writer = .fixed(&buf);
+    try writeSelect(&w, .{ .table = "users", .where = "active = 1" });
+    try testing.expectEqualStrings("SELECT * FROM users WHERE active = 1", w.buffered());
 }

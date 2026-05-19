@@ -1,6 +1,7 @@
 .{
-    .name    = .zql,
-    .version = "0.1.0",
-    .minimum_zig_version = "0.14.0",
-    .paths   = .{""},
+    .name        = .zql,
+    .version     = "0.2.0",
+    .fingerprint = 0xd4075150487f4a41,
+    .minimum_zig_version = "0.16.0",
+    .paths       = .{""},
 }
