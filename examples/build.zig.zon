@@ -1,0 +1,16 @@
+.{
+    .name        = .zql_examples,
+    .version     = "0.0.0",
+    .fingerprint = 0xf2c63abc3b799eb4,
+    .minimum_zig_version = "0.16.0",
+    .dependencies = .{
+        .zql = .{
+            .path = "..",
+        },
+        .httpz = .{
+            .url  = "git+https://github.com/karlseguin/http.zig#03658c279937066201aba8c0a8f1936d821d0709",
+            .hash = "httpz-0.0.0-PNVzrLjJCAD37S0CcrXpsjSqr86hVjK0rsALTDJ98AAJ",
+        },
+    },
+    .paths = .{ "build.zig", "build.zig.zon", "src" },
+}

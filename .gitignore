@@ -1,0 +1,4 @@
+# Zig build artifacts (apply at any nesting level)
+.zig-cache/
+zig-out/
+zig-pkg/
