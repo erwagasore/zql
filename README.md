@@ -1,9 +1,14 @@
 # zql
 
-A zero-dependency, database-agnostic SQL query builder for Zig.
+A zero-dependency, database-agnostic SQL string builder for dynamic Zig code.
+
+zql helps assemble common SQL statements from plain Zig config structs, optionals,
+slices, and enums. It is intentionally not an ORM, not a database driver, and
+not a SQL-injection safety layer: drivers still execute queries and bind values.
 
 - **Pure Zig** — no C bindings, no runtime dependencies
 - **Database-agnostic** — works with SQLite, PostgreSQL, rqlite, or any SQL database
+- **Dynamic-query friendly** — optional filters, pagination, ordering, CRUD, simple DDL, and reusable fragments
 - **Idiomatic** — built on `std.Io.Writer`, follows Zig standard library memory conventions
 - **Simple** — one function per statement type, plain struct config
 - **Zig 0.16+**
@@ -96,18 +101,26 @@ and careful attention to spacing between clauses.
 ### Composable WHERE without concatenation
 
 ```zig
-// Conditionally add filters
+// Conditionally add filters from Zig values.
 var conditions: std.ArrayList([]const u8) = .empty;
 defer conditions.deinit(a);            // no-op with arena, required with GPA
-try conditions.append(a, "active = 1");
-if (jurisdiction) |j| {
-    try conditions.append(a, try std.fmt.allocPrint(a, "jurisdiction = '{s}'", .{j}));
+
+const is_active = true;                // trusted program state
+try conditions.append(a, if (is_active) "active = 1" else "active = 0");
+
+const start = "2026-01-01";            // trusted reporting constants
+const end   = "2026-02-01";
+try conditions.append(a, try zql.betweenDates(a, "created_at", start, end));
+
+if (jurisdiction != null) {            // user/request value: use a placeholder
+    try conditions.append(a, "jurisdiction = ?");
 }
 
 const sql = try zql.select(a, .{
     .table = "users",
     .where = try zql.all(a, conditions.items),
 });
+// Bind jurisdiction separately if that placeholder was added.
 ```
 
 ### Refactoring safety
@@ -168,15 +181,26 @@ var arena = std.heap.ArenaAllocator.init(allocator);
 defer arena.deinit();
 const a = arena.allocator();
 
+const is_active = true;
+const start = "2026-01-01";
+const end   = "2026-02-01";
+
 const sql = try zql.select(a, .{
     .table = "users",
     .cols  = &.{ try zql.sumAs(a, "amount", "total"), "user_id" },
     .where = try zql.all(a, &.{
-        "active = 1",
-        try zql.betweenDates(a, "created_at", "2026-01-01", "2026-04-01"),
+        if (is_active) "active = 1" else "active = 0",
+        try zql.betweenDates(a, "created_at", start, end),
     }),
     .group = &.{"user_id"},
 });
+```
+
+If `start` and `end` came from a request, prefer placeholders instead:
+
+```zig
+.where = "active = ? AND created_at BETWEEN ? AND ?",
+// Then bind: .{ is_active, start_from_request, end_from_request }
 ```
 
 ```zig
@@ -289,12 +313,18 @@ statements, for free.
 
 ## Installation
 
-Add to your `build.zig.zon`:
+Fetch the current release with Zig's package manager:
+
+```bash
+zig fetch --save https://github.com/erwagasore/zql/archive/refs/tags/v0.0.1.tar.gz
+```
+
+Or add it to your `build.zig.zon` manually:
 
 ```zig
 .dependencies = .{
     .zql = .{
-        .url  = "https://github.com/yourname/zql/archive/refs/tags/v0.1.0.tar.gz",
+        .url  = "https://github.com/erwagasore/zql/archive/refs/tags/v0.0.1.tar.gz",
         .hash = "...",
     },
 },
@@ -313,67 +343,93 @@ exe.root_module.addImport("zql", zql_dep.module("zql"));
 
 ### SELECT
 
-```zig
-// SELECT * FROM users
-const sql = try zql.select(allocator, .{
-    .table = "users",
-});
+Use Zig values to decide which SQL clauses exist. zql handles clause order,
+spacing, and typed fields while your driver handles bound values.
 
-// SELECT id, name, email FROM users WHERE active = 1 ORDER BY name ASC LIMIT 50
+```zig
+const USER_COLS = &.{ "id", "name", "email", "active", "created_at" };
+
+const only_active = true;
+const page: ?usize = 2;
+const page_size: usize = 50;
+
 const sql = try zql.select(allocator, .{
     .table  = "users",
-    .cols   = &.{ "id", "name", "email" },
-    .where  = "active = 1",
-    .order  = &.{.{ .col = "name", .dir = .asc }},
-    .limit  = 50,
-    .offset = 0,
+    .cols   = USER_COLS,
+    .where  = if (only_active) "active = ?" else null,
+    .order  = &.{.{ .col = "created_at", .dir = .desc }},
+    .limit  = if (page != null) page_size else null,
+    .offset = if (page) |n| n * page_size else null,
 });
+// → SELECT id, name, email, active, created_at FROM users
+//   WHERE active = ? ORDER BY created_at DESC LIMIT 50 OFFSET 100
+// Then bind the active value with your database driver.
+```
 
-// SELECT DISTINCT country FROM users
-const sql = try zql.select(allocator, .{
-    .table    = "users",
-    .cols     = &.{"country"},
-    .distinct = true,
-});
+Reusable constants and runtime flags keep query shape in Zig instead of in
+manual string concatenation:
 
-// SELECT users.id, orders.total FROM users
-// INNER JOIN orders ON orders.user_id = users.id
-// WHERE users.active = 1
+```zig
+const include_orders = true;
+const report_cols: []const []const u8 = if (include_orders)
+    &.{ "users.id", "users.email", "orders.total" }
+else
+    &.{ "users.id", "users.email" };
+
 const sql = try zql.select(allocator, .{
     .table = "users",
-    .cols  = &.{ "users.id", "orders.total" },
-    .joins = &.{"INNER JOIN orders ON orders.user_id = users.id"},
-    .where = "users.active = 1",
+    .cols  = report_cols,
+    .joins = if (include_orders)
+        &.{"INNER JOIN orders ON orders.user_id = users.id"}
+    else
+        &.{},
+    .where = "users.active = ?",
 });
+```
 
-// SELECT user_id, COUNT(*) AS total FROM orders
-// GROUP BY user_id HAVING COUNT(*) > 5
+Aggregate expressions are just Zig values too:
+
+```zig
+const total_col = try zql.countAs(allocator, "*", "total");
+defer allocator.free(total_col);
+
 const sql = try zql.select(allocator, .{
     .table  = "orders",
-    .cols   = &.{ "user_id", try zql.countAs(allocator, "*", "total") },
+    .cols   = &.{ "user_id", total_col },
     .group  = &.{"user_id"},
-    .having = "COUNT(*) > 5",
+    .having = "COUNT(*) > ?",
 });
 ```
 
 ### INSERT
 
+Use placeholders in `.values`, then bind the actual Zig values with your driver:
+
 ```zig
-// INSERT INTO users (name, email) VALUES ('Eugene', 'eugene@pindo.io')
+const USER_INSERT_COLS = &.{ "name", "email", "active" };
+
 const sql = try zql.insert(allocator, .{
     .table  = "users",
-    .cols   = &.{ "name", "email" },
-    .values = &.{ "'Eugene'", "'eugene@pindo.io'" },
+    .cols   = USER_INSERT_COLS,
+    .values = &.{ "?", "?", "?" },
 });
+// Then bind: .{ new_user.name, new_user.email, new_user.active }
+```
 
-// Multi-row insert
+For batch inserts, build the row shape in Zig and keep SQL placeholders separate
+from the values you bind:
+
+```zig
+const row_count = users.len;
+var rows = try allocator.alloc([]const []const u8, row_count);
+defer allocator.free(rows);
+
+for (rows) |*row| row.* = &.{ "?", "?" };
+
 const sql = try zql.insertMany(allocator, .{
     .table = "users",
     .cols  = &.{ "name", "email" },
-    .rows  = &.{
-        &.{ "'Eugene'", "'eugene@pindo.io'" },
-        &.{ "'Alice'",  "'alice@example.com'" },
-    },
+    .rows  = rows,
 });
 ```
 
@@ -384,27 +440,34 @@ const sql = try zql.insertMany(allocator, .{
 
 ### UPDATE
 
+Dynamic `SET` lists are ordinary Zig slices. Add only the fields the caller sent:
+
 ```zig
-// UPDATE users SET name = 'Eugene', active = 1 WHERE id = 1
+var sets: std.ArrayList([]const u8) = .empty;
+defer sets.deinit(allocator);
+
+if (patch.name != null)   try sets.append(allocator, "name = ?");
+if (patch.email != null)  try sets.append(allocator, "email = ?");
+if (patch.active != null) try sets.append(allocator, "active = ?");
+
 const sql = try zql.update(allocator, .{
     .table = "users",
-    .set   = &.{ "name = 'Eugene'", "active = 1" },
-    .where = "id = 1",
+    .set   = sets.items,
+    .where = "id = ?",
 });
 ```
 
 ### DELETE
 
-```zig
-// DELETE FROM users WHERE id = 1
-const sql = try zql.delete(allocator, .{
-    .table = "users",
-    .where = "id = 1",
-});
+Use the presence or absence of a Zig value to decide whether the delete is
+scoped. Prefer a placeholder when the value comes from outside the program:
 
-// DELETE FROM users (all rows)
+```zig
+const maybe_id: ?u64 = 42;
+
 const sql = try zql.delete(allocator, .{
     .table = "users",
+    .where = if (maybe_id != null) "id = ?" else null,
 });
 ```
 
@@ -446,15 +509,17 @@ const sql = try zql.createIndex(allocator, .{
 ### WHERE helpers
 
 All return caller-owned slices. Compose freely — each helper is just a string.
+For untrusted values, prefer helper inputs that are placeholders and bind the
+actual values with your driver.
 
 ```zig
 // AND
-const w = try zql.all(allocator, &.{ "active = 1", "age > 18" });
-// → "active = 1 AND age > 18"
+const w = try zql.all(allocator, &.{ "active = ?", "age > ?" });
+// → "active = ? AND age > ?"
 
 // OR
-const w = try zql.any(allocator, &.{ "role = 'admin'", "role = 'mod'" });
-// → "role = 'admin' OR role = 'mod'"
+const w = try zql.any(allocator, &.{ "role = ?", "role = ?" });
+// → "role = ? OR role = ?"
 
 // Grouping
 const w = try zql.group(allocator, "a = 1 OR b = 2");
@@ -480,17 +545,27 @@ const w = try zql.notIn(allocator, "id", &.{ "1", "2" });
 const w = try zql.between(allocator, "age", "18", "65");
 // → "age BETWEEN 18 AND 65"
 
-// BETWEEN (datetime — quotes the values for you)
-const w = try zql.betweenDates(allocator, "created_at", "2026-01-01", "2026-04-01");
+// Trusted Zig variables can be rendered as date literals.
+const start = "2026-01-01";
+const end   = "2026-04-01";
+const trusted = try zql.betweenDates(allocator, "created_at", start, end);
 // → "created_at BETWEEN '2026-01-01' AND '2026-04-01'"
+
+// If start/end came from a request, use placeholders instead.
+const w = try zql.between(allocator, "created_at", "?", "?");
+// → "created_at BETWEEN ? AND ?"
 
 // IS NULL / IS NOT NULL
 const w = try zql.isNull(allocator, "deleted_at");
 const w = try zql.isNotNull(allocator, "email");
 
-// LIKE
-const w = try zql.like(allocator, "name", "Eug%");
+// Trusted Zig variables can be rendered as LIKE literals.
+const internal_prefix = "Eug%";
+const trusted = try zql.like(allocator, "name", internal_prefix);
 // → "name LIKE 'Eug%'"
+
+// If the pattern came from a request, use a placeholder instead.
+const w = "name LIKE ?";
 ```
 
 Compose complex conditions with an arena for clean inline nesting:
@@ -574,9 +649,10 @@ statement:
 const base = try zql.insert(a, .{
     .table  = "users",
     .cols   = &.{ "name", "email" },
-    .values = &.{ "'Eugene'", "'e@p.io'" },
+    .values = &.{ "?", "?" },
 });
 const sql = try std.fmt.allocPrint(a, "{s} RETURNING id, created_at", .{base});
+// Then bind the name and email values with your driver.
 ```
 
 ### Subqueries
