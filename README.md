@@ -138,6 +138,76 @@ const sql = try zql.select(a, .{
 });
 ```
 
+### A concrete comparison
+
+Here is the same dynamic query built with raw SQL and with zql. The endpoint
+lists tasks filtered by `status` (a validated enum — trusted) and an optional
+`search` string from HTTP query parameters (untrusted).
+
+**Without zql:**
+
+```zig
+var parts: std.ArrayList([]const u8) = .empty;
+defer parts.deinit(a);
+
+try parts.append(a, "status = ?");
+if (search != null) {
+    try parts.append(a, "title LIKE ?");
+}
+
+const where = try std.mem.join(a, " AND ", parts.items);
+
+const query = try std.fmt.allocPrint(a,
+    "SELECT id, title, status FROM tasks WHERE {s} ORDER BY created_at DESC",
+    .{where},
+);
+
+var stmt = try db.prepareDynamic(query);
+defer stmt.deinit();
+
+if (search != null) {
+    try stmt.exec(.{ status, search.? });
+} else {
+    try stmt.exec(.{status});
+}
+```
+
+**With zql:**
+
+```zig
+const sql = try zql.select(a, .{
+    .table = "tasks",
+    .cols = &.{ "id", "title", "status" },
+    .where = try zql.all(a, &.{
+        try zql.eq(a, "status", status),
+        if (search) |_| "title LIKE ?" else null,
+    }),
+    .order = &.{.{ .col = "created_at", .dir = .desc }},
+});
+
+var stmt = try db.prepare(sql);
+defer stmt.deinit();
+
+if (search) |s| {
+    try stmt.exec(.{s});
+} else {
+    try stmt.exec(.{});
+}
+```
+
+| What you write | Without zql | With zql |
+|---|---|---|
+| Build WHERE | `ArrayList` + `std.mem.join` | `zql.all()` with `null` for optional |
+| Assemble full query | `std.fmt.allocPrint` | Struct config |
+| Trusted `status` value | In bind tuple, order-sensitive | Inlined by zql |
+| Optional `search` | Branching logic | `null` in array |
+| SQL preparation | `prepareDynamic` (runtime) | `prepare` (comptime-checked) |
+| Clause ordering | Manual string concat | Guaranteed by zql |
+
+zql automates the boring, error-prone parts of dynamic SQL construction
+while keeping the safety boundary intact: the driver still binds the
+untrusted `search` value.
+
 ### When to use raw SQL instead
 
 zql covers the common 80% — CRUD, pagination, filters, aggregates, joins. For the
