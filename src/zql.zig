@@ -40,9 +40,12 @@ pub const Column = struct {
 /// `writeX` signature for the precise subset).
 pub const Error = error{
     ColsValuesMismatch,
+    NoColumns,
+    NoIndexName,
     NoRows,
     NoSetClauses,
-    NoColumns,
+    NoTable,
+    NoValues,
 };
 
 // ── Internal: comma-separated list ────────────────────────────────────────────
@@ -103,7 +106,9 @@ pub fn select(gpa: Allocator, cfg: SelectConfig) ![]u8 {
     return renderOwned(gpa, cfg, writeSelect);
 }
 
-pub fn writeSelect(w: *Writer, cfg: SelectConfig) Writer.Error!void {
+pub fn writeSelect(w: *Writer, cfg: SelectConfig) (Writer.Error || error{NoTable})!void {
+    if (cfg.table.len == 0) return error.NoTable;
+
     try w.writeAll("SELECT ");
     if (cfg.distinct) try w.writeAll("DISTINCT ");
     if (cfg.cols.len == 0) try w.writeByte('*') else try writeList(w, cfg.cols);
@@ -238,6 +243,10 @@ test "select full" {
     );
 }
 
+test "select missing table returns error" {
+    try testing.expectError(error.NoTable, select(testing.allocator, .{}));
+}
+
 // ── INSERT ────────────────────────────────────────────────────────────────────
 
 pub const InsertConfig = struct {
@@ -250,7 +259,10 @@ pub fn insert(gpa: Allocator, cfg: InsertConfig) ![]u8 {
     return renderOwned(gpa, cfg, writeInsert);
 }
 
-pub fn writeInsert(w: *Writer, cfg: InsertConfig) (Writer.Error || error{ColsValuesMismatch})!void {
+pub fn writeInsert(w: *Writer, cfg: InsertConfig) (Writer.Error || error{ NoTable, NoColumns, NoValues, ColsValuesMismatch })!void {
+    if (cfg.table.len == 0) return error.NoTable;
+    if (cfg.cols.len == 0) return error.NoColumns;
+    if (cfg.values.len == 0) return error.NoValues;
     if (cfg.cols.len != cfg.values.len) return error.ColsValuesMismatch;
 
     try w.print("INSERT INTO {s} (", .{cfg.table});
@@ -281,6 +293,21 @@ test "insert cols values mismatch returns error" {
     }));
 }
 
+test "insert missing required fields return errors" {
+    try testing.expectError(error.NoTable, insert(testing.allocator, .{
+        .cols   = &.{"name"},
+        .values = &.{"?"},
+    }));
+    try testing.expectError(error.NoColumns, insert(testing.allocator, .{
+        .table  = "users",
+        .values = &.{"?"},
+    }));
+    try testing.expectError(error.NoValues, insert(testing.allocator, .{
+        .table = "users",
+        .cols  = &.{"name"},
+    }));
+}
+
 // ── INSERT MANY ───────────────────────────────────────────────────────────────
 
 pub const InsertManyConfig = struct {
@@ -293,7 +320,9 @@ pub fn insertMany(gpa: Allocator, cfg: InsertManyConfig) ![]u8 {
     return renderOwned(gpa, cfg, writeInsertMany);
 }
 
-pub fn writeInsertMany(w: *Writer, cfg: InsertManyConfig) (Writer.Error || error{ NoRows, ColsValuesMismatch })!void {
+pub fn writeInsertMany(w: *Writer, cfg: InsertManyConfig) (Writer.Error || error{ NoTable, NoColumns, NoRows, ColsValuesMismatch })!void {
+    if (cfg.table.len == 0) return error.NoTable;
+    if (cfg.cols.len == 0) return error.NoColumns;
     if (cfg.rows.len == 0) return error.NoRows;
     for (cfg.rows) |row| if (row.len != cfg.cols.len) return error.ColsValuesMismatch;
 
@@ -333,6 +362,17 @@ test "insert many no rows returns error" {
     }));
 }
 
+test "insert many missing required fields return errors" {
+    try testing.expectError(error.NoTable, insertMany(testing.allocator, .{
+        .cols = &.{"name"},
+        .rows = &.{&.{"?"}},
+    }));
+    try testing.expectError(error.NoColumns, insertMany(testing.allocator, .{
+        .table = "users",
+        .rows  = &.{&.{"?"}},
+    }));
+}
+
 // ── UPDATE ────────────────────────────────────────────────────────────────────
 
 pub const UpdateConfig = struct {
@@ -345,7 +385,8 @@ pub fn update(gpa: Allocator, cfg: UpdateConfig) ![]u8 {
     return renderOwned(gpa, cfg, writeUpdate);
 }
 
-pub fn writeUpdate(w: *Writer, cfg: UpdateConfig) (Writer.Error || error{NoSetClauses})!void {
+pub fn writeUpdate(w: *Writer, cfg: UpdateConfig) (Writer.Error || error{ NoTable, NoSetClauses })!void {
+    if (cfg.table.len == 0) return error.NoTable;
     if (cfg.set.len == 0) return error.NoSetClauses;
 
     try w.print("UPDATE {s} SET ", .{cfg.table});
@@ -383,6 +424,12 @@ test "update no set clauses returns error" {
     }));
 }
 
+test "update missing table returns error" {
+    try testing.expectError(error.NoTable, update(testing.allocator, .{
+        .set = &.{"active = ?"},
+    }));
+}
+
 // ── DELETE ────────────────────────────────────────────────────────────────────
 
 pub const DeleteConfig = struct {
@@ -394,7 +441,9 @@ pub fn delete(gpa: Allocator, cfg: DeleteConfig) ![]u8 {
     return renderOwned(gpa, cfg, writeDelete);
 }
 
-pub fn writeDelete(w: *Writer, cfg: DeleteConfig) Writer.Error!void {
+pub fn writeDelete(w: *Writer, cfg: DeleteConfig) (Writer.Error || error{NoTable})!void {
+    if (cfg.table.len == 0) return error.NoTable;
+
     try w.print("DELETE FROM {s}", .{cfg.table});
     if (cfg.where) |x| try w.print(" WHERE {s}", .{x});
 }
@@ -414,6 +463,10 @@ test "delete all rows" {
     try testing.expectEqualStrings("DELETE FROM users", sql);
 }
 
+test "delete missing table returns error" {
+    try testing.expectError(error.NoTable, delete(testing.allocator, .{}));
+}
+
 // ── CREATE TABLE ──────────────────────────────────────────────────────────────
 
 pub const CreateTableConfig = struct {
@@ -426,7 +479,8 @@ pub fn createTable(gpa: Allocator, cfg: CreateTableConfig) ![]u8 {
     return renderOwned(gpa, cfg, writeCreateTable);
 }
 
-pub fn writeCreateTable(w: *Writer, cfg: CreateTableConfig) (Writer.Error || error{NoColumns})!void {
+pub fn writeCreateTable(w: *Writer, cfg: CreateTableConfig) (Writer.Error || error{ NoTable, NoColumns })!void {
+    if (cfg.table.len == 0) return error.NoTable;
     if (cfg.cols.len == 0) return error.NoColumns;
 
     try w.writeAll(if (cfg.if_not_exists) "CREATE TABLE IF NOT EXISTS " else "CREATE TABLE ");
@@ -469,6 +523,15 @@ test "create table if not exists" {
     try testing.expectEqualStrings("CREATE TABLE IF NOT EXISTS users (id INTEGER)", sql);
 }
 
+test "create table missing required fields return errors" {
+    try testing.expectError(error.NoTable, createTable(testing.allocator, .{
+        .cols = &.{.{ .name = "id", .type = "INTEGER" }},
+    }));
+    try testing.expectError(error.NoColumns, createTable(testing.allocator, .{
+        .table = "users",
+    }));
+}
+
 // ── DROP TABLE ────────────────────────────────────────────────────────────────
 
 pub const DropTableConfig = struct {
@@ -480,7 +543,9 @@ pub fn dropTable(gpa: Allocator, cfg: DropTableConfig) ![]u8 {
     return renderOwned(gpa, cfg, writeDropTable);
 }
 
-pub fn writeDropTable(w: *Writer, cfg: DropTableConfig) Writer.Error!void {
+pub fn writeDropTable(w: *Writer, cfg: DropTableConfig) (Writer.Error || error{NoTable})!void {
+    if (cfg.table.len == 0) return error.NoTable;
+
     try w.writeAll(if (cfg.if_exists) "DROP TABLE IF EXISTS " else "DROP TABLE ");
     try w.writeAll(cfg.table);
 }
@@ -500,6 +565,10 @@ test "drop table if exists" {
     try testing.expectEqualStrings("DROP TABLE IF EXISTS users", sql);
 }
 
+test "drop table missing table returns error" {
+    try testing.expectError(error.NoTable, dropTable(testing.allocator, .{}));
+}
+
 // ── CREATE INDEX ──────────────────────────────────────────────────────────────
 
 pub const CreateIndexConfig = struct {
@@ -514,7 +583,9 @@ pub fn createIndex(gpa: Allocator, cfg: CreateIndexConfig) ![]u8 {
     return renderOwned(gpa, cfg, writeCreateIndex);
 }
 
-pub fn writeCreateIndex(w: *Writer, cfg: CreateIndexConfig) (Writer.Error || error{NoColumns})!void {
+pub fn writeCreateIndex(w: *Writer, cfg: CreateIndexConfig) (Writer.Error || error{ NoIndexName, NoTable, NoColumns })!void {
+    if (cfg.name.len == 0) return error.NoIndexName;
+    if (cfg.table.len == 0) return error.NoTable;
     if (cfg.cols.len == 0) return error.NoColumns;
 
     try w.writeAll("CREATE ");
@@ -549,6 +620,21 @@ test "create unique index if not exists" {
         "CREATE UNIQUE INDEX IF NOT EXISTS idx_users_email ON users (email)",
         sql,
     );
+}
+
+test "create index missing required fields return errors" {
+    try testing.expectError(error.NoIndexName, createIndex(testing.allocator, .{
+        .table = "users",
+        .cols  = &.{"email"},
+    }));
+    try testing.expectError(error.NoTable, createIndex(testing.allocator, .{
+        .name = "idx_users_email",
+        .cols = &.{"email"},
+    }));
+    try testing.expectError(error.NoColumns, createIndex(testing.allocator, .{
+        .name  = "idx_users_email",
+        .table = "users",
+    }));
 }
 
 // ── WHERE helpers ─────────────────────────────────────────────────────────────

@@ -241,9 +241,12 @@ wrappers around the writer forms.
 ```zig
 pub const Error = error{
     ColsValuesMismatch, // insert: cols.len != values.len; insertMany: row mismatch
+    NoColumns,          // insert/createTable/createIndex: required column list is empty
+    NoIndexName,        // createIndex: name is empty
     NoRows,             // insertMany: rows is empty
     NoSetClauses,       // update: set is empty
-    NoColumns,          // createTable / createIndex: cols is empty
+    NoTable,            // statement requires a table name, but table is empty
+    NoValues,           // insert: values is empty
 };
 ```
 
