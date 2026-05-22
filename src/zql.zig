@@ -642,6 +642,30 @@ test "create index missing required fields return errors" {
 // Composable fragment builders. Each returns a caller-owned slice; pass results
 // to `.where`/`.having` or compose with `all`/`any`/`group`/`not`.
 
+pub fn eq(gpa: Allocator, col: []const u8, value: []const u8) ![]u8 {
+    return std.fmt.allocPrint(gpa, "{s} = {s}", .{ col, value });
+}
+
+pub fn ne(gpa: Allocator, col: []const u8, value: []const u8) ![]u8 {
+    return std.fmt.allocPrint(gpa, "{s} <> {s}", .{ col, value });
+}
+
+pub fn gt(gpa: Allocator, col: []const u8, value: []const u8) ![]u8 {
+    return std.fmt.allocPrint(gpa, "{s} > {s}", .{ col, value });
+}
+
+pub fn lt(gpa: Allocator, col: []const u8, value: []const u8) ![]u8 {
+    return std.fmt.allocPrint(gpa, "{s} < {s}", .{ col, value });
+}
+
+pub fn ge(gpa: Allocator, col: []const u8, value: []const u8) ![]u8 {
+    return std.fmt.allocPrint(gpa, "{s} >= {s}", .{ col, value });
+}
+
+pub fn le(gpa: Allocator, col: []const u8, value: []const u8) ![]u8 {
+    return std.fmt.allocPrint(gpa, "{s} <= {s}", .{ col, value });
+}
+
 pub fn all(gpa: Allocator, conditions: []const []const u8) ![]u8 {
     return std.mem.join(gpa, " AND ", conditions);
 }
@@ -698,6 +722,42 @@ pub fn isNotNull(gpa: Allocator, col: []const u8) ![]u8 {
 
 pub fn like(gpa: Allocator, col: []const u8, pattern: []const u8) ![]u8 {
     return std.fmt.allocPrint(gpa, "{s} LIKE '{s}'", .{ col, pattern });
+}
+
+test "where eq" {
+    const w = try eq(testing.allocator, "status", "pending");
+    defer testing.allocator.free(w);
+    try testing.expectEqualStrings("status = pending", w);
+}
+
+test "where ne" {
+    const w = try ne(testing.allocator, "role", "admin");
+    defer testing.allocator.free(w);
+    try testing.expectEqualStrings("role <> admin", w);
+}
+
+test "where gt" {
+    const w = try gt(testing.allocator, "age", "18");
+    defer testing.allocator.free(w);
+    try testing.expectEqualStrings("age > 18", w);
+}
+
+test "where lt" {
+    const w = try lt(testing.allocator, "age", "65");
+    defer testing.allocator.free(w);
+    try testing.expectEqualStrings("age < 65", w);
+}
+
+test "where ge" {
+    const w = try ge(testing.allocator, "score", "100");
+    defer testing.allocator.free(w);
+    try testing.expectEqualStrings("score >= 100", w);
+}
+
+test "where le" {
+    const w = try le(testing.allocator, "score", "500");
+    defer testing.allocator.free(w);
+    try testing.expectEqualStrings("score <= 500", w);
 }
 
 test "where all" {
