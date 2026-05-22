@@ -36,15 +36,19 @@ Tick the task only after its branch is merged back to `main`.
 
   *Done when:* invalid modeled statements fail with documented errors, existing valid queries keep their output, and `zig build test` passes.
 
-- [ ] **design(api): revisit value binding and dialect extension ergonomics**
+- [x] **design(api): revisit value binding and dialect extension ergonomics**
 
-  Reassess the API before changing helper names or adding dialect-specific clauses. Decide how zql should handle values near conditions, bind ordering, trusted literals versus user input, and dialect-specific features such as `RETURNING` without weakening the database-agnostic contract. Anchor this to `SPEC.md:21` for safety boundaries, `SPEC.md:27` for correctness expectations, and `SPEC.md:39` for documentation requirements.
+  Decided: zql remains a pure SQL string builder. Helpers inline trusted literal values directly. Untrusted input uses driver placeholders bound separately. No bind tracking, no `Value`/`Fragment` types, no second API tier. `RETURNING` stays a raw SQL recipe because it is not dialect-neutral. Decisions recorded in `AGENTS.md` sections 8–9. Anchor this to `SPEC.md:21` for safety boundaries, `SPEC.md:27` for correctness expectations, and `SPEC.md:39` for documentation requirements.
 
-  *Done when:* `docs/api-ergonomics.md` records the preferred direction and tradeoffs for value binding, literal helpers, and dialect extension points, with follow-up implementation tasks identified if needed.
+  *Done when:* decisions are reflected in `AGENTS.md` and `README.md`; no follow-up implementation tasks remain.
 
 ## Phase 3 — Deferred dialect-specific expansion
 
-- [ ] **docs(dialects): document why returning stays a raw SQL recipe**
+- [x] **docs(dialects): document why returning stays a raw SQL recipe**
+
+  Already covered in README dialect-specific features section and AGENTS.md safety boundary. `RETURNING` is available in PostgreSQL and modern SQLite but not universal (not in MySQL, SQL Server uses `OUTPUT`). No core `.returning` API will be added. Anchor this to `SPEC.md:1` for database-agnostic positioning and `SPEC.md:39` for documentation requirements.
+
+  *Done when:* README and AGENTS.md clearly explain the boundary.
 
   Keep `RETURNING` out of the core statement configs for now because it is not supported uniformly across SQL databases. Update the dialect-specific README section if needed so users understand when to append raw SQL and why this remains outside the database-agnostic core. Anchor this to `SPEC.md:1` for database-agnostic positioning and `SPEC.md:39` for documentation requirements.
 
