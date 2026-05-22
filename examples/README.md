@@ -1,10 +1,13 @@
 # zql + httpz example
 
-A small `users` CRUD service demonstrating how zql is meant to be used inside
-an HTTP handler against `req.arena`.
+A small `users` CRUD service demonstrating zql query construction inside an
+HTTP handler against `req.arena`.
 
 There is no database. Each handler returns the SQL that zql built — `curl` the
-endpoints to see exactly what the library produces for each input.
+endpoints to see exactly what the library produces for each input. Because the
+example has no driver to bind values, the demo response inlines route/body
+values so the generated SQL is visible. Production handlers should use the
+placeholder pattern shown below instead.
 
 ## Run
 
@@ -27,10 +30,21 @@ curl -XDELETE http://localhost:5882/users/42
 curl  http://localhost:5882/users/stats
 ```
 
-Example response:
+Demo response from this no-database example:
 
 ```json
 { "sql": "INSERT INTO users (name, email, active) VALUES ('Eugene', 'e@p.io', 1)" }
+```
+
+Production shape with a real driver:
+
+```zig
+const sql = try zql.insert(req.arena, .{
+    .table = "users",
+    .cols = &.{ "name", "email", "active" },
+    .values = &.{ "?", "?", "?" },
+});
+try db.exec(sql, .{ new.name, new.email, new.active });
 ```
 
 ## Routes
@@ -47,7 +61,7 @@ Example response:
 ## ⚠️ For demonstration only
 
 These handlers inline route and body string values directly into the SQL
-(e.g. `id = '42'`) so the response shows complete, runnable statements.
+(e.g. `id = '42'`) only because there is no database driver in this example.
 **Do not copy this pattern to production code** — it is vulnerable to SQL
 injection.
 
