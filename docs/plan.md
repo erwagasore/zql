@@ -28,7 +28,7 @@ Tick the task only after its branch is merged back to `main`.
 
   *Done when:* `zig build check` works and `build.zig.zon` paths are restricted.
 
-- [ ] **test(coverage): add missing edge case tests**
+- [x] **test(coverage): add missing edge case tests**
 
   Add tests for: multiple `joins`, `offset` without `limit`, mixed `order` directions, `distinct` with explicit columns, `writeInsertMany` via fixed buffer, and `update`/`delete` writer variants. Anchor this to `SPEC.md:171` for the quality bar.
 
