@@ -56,10 +56,10 @@ Where fragment builders. Each returns a caller-owned `[]u8`.
 | `in(col, values)` | `col IN (v1, v2, v3)` |
 | `notIn(col, values)` | `col NOT IN (v1, v2, v3)` |
 | `between(col, low, high)` | `col BETWEEN low AND high` |
-| `betweenDates(col, from, to)` | `col BETWEEN 'from' AND 'to'` |
+| `betweenDates(col, from, to)` | `col BETWEEN from AND to` |
 | `isNull(col)` | `col IS NULL` |
 | `isNotNull(col)` | `col IS NOT NULL` |
-| `like(col, pattern)` | `col LIKE 'pattern'` |
+| `like(col, pattern)` | `col LIKE pattern` |
 
 ### Aggregate and scalar functions
 
