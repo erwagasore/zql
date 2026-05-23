@@ -22,7 +22,7 @@ Tick the task only after its branch is merged back to `main`.
 
   *Done when:* `like` and `betweenDates` no longer quote values, all tests and docs reflect the change, and `zig build test` passes.
 
-- [ ] **feat(build): add `check` step and restrict package manifest paths**
+- [x] **feat(build): add `check` step and restrict package manifest paths**
 
   Add a `check` step to `build.zig` for fast compilation checking. Restrict `build.zig.zon` `.paths` to `src`, `build.zig`, `build.zig.zon`, `LICENSE`, and `README.md` to avoid publishing non-library files. Anchor this to `SPEC.md:171` for the quality bar.
 
