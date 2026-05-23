@@ -34,7 +34,7 @@ Tick the task only after its branch is merged back to `main`.
 
   *Done when:* new tests cover the listed gaps and `zig build test` passes.
 
-- [ ] **feat(aggregates): add `distinct` variant for `count`**
+- [x] **feat(aggregates): add `distinct` variant for `count`**
 
   Add `countDistinct` and `countDistinctAs` helpers for `COUNT(DISTINCT col)`. This is common SQL that currently requires passing `"DISTINCT id"` as a raw column name to `count()`. Anchor this to `SPEC.md:20` for the API surface.
 
