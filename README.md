@@ -643,9 +643,9 @@ const w = try zql.notIn(allocator, "id", &.{ "1", "2" });
 const w = try zql.between(allocator, "age", "18", "65");
 // → "age BETWEEN 18 AND 65"
 
-// Trusted Zig variables can be rendered as date literals.
-const start = "2026-01-01";
-const end   = "2026-04-01";
+// Date literals — quote values yourself if your dialect requires it.
+const start = "'2026-01-01'";
+const end   = "'2026-04-01'";
 const trusted = try zql.betweenDates(allocator, "created_at", start, end);
 // → "created_at BETWEEN '2026-01-01' AND '2026-04-01'"
 
@@ -657,8 +657,8 @@ const w = try zql.between(allocator, "created_at", "?", "?");
 const w = try zql.isNull(allocator, "deleted_at");
 const w = try zql.isNotNull(allocator, "email");
 
-// Trusted Zig variables can be rendered as LIKE literals.
-const internal_prefix = "Eug%";
+// LIKE with a literal pattern — quote it yourself if your dialect requires it.
+const internal_prefix = "'Eug%'";
 const trusted = try zql.like(allocator, "name", internal_prefix);
 // → "name LIKE 'Eug%'"
 

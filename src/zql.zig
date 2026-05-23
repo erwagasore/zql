@@ -706,10 +706,10 @@ pub fn between(gpa: Allocator, col: []const u8, low: []const u8, high: []const u
     return std.fmt.allocPrint(gpa, "{s} BETWEEN {s} AND {s}", .{ col, low, high });
 }
 
-/// `betweenDates` is like `between` but quotes the values — handy for ISO8601
-/// timestamps that the caller has not pre-quoted.
+/// `betweenDates` is like `between` but intended for date literal values.
+/// The caller must quote the values if their dialect requires it.
 pub fn betweenDates(gpa: Allocator, col: []const u8, from: []const u8, to: []const u8) ![]u8 {
-    return std.fmt.allocPrint(gpa, "{s} BETWEEN '{s}' AND '{s}'", .{ col, from, to });
+    return std.fmt.allocPrint(gpa, "{s} BETWEEN {s} AND {s}", .{ col, from, to });
 }
 
 pub fn isNull(gpa: Allocator, col: []const u8) ![]u8 {
@@ -721,7 +721,7 @@ pub fn isNotNull(gpa: Allocator, col: []const u8) ![]u8 {
 }
 
 pub fn like(gpa: Allocator, col: []const u8, pattern: []const u8) ![]u8 {
-    return std.fmt.allocPrint(gpa, "{s} LIKE '{s}'", .{ col, pattern });
+    return std.fmt.allocPrint(gpa, "{s} LIKE {s}", .{ col, pattern });
 }
 
 test "where eq" {
@@ -815,7 +815,7 @@ test "where is not null" {
 }
 
 test "where like" {
-    const w = try like(testing.allocator, "name", "Eug%");
+    const w = try like(testing.allocator, "name", "'Eug%'");
     defer testing.allocator.free(w);
     try testing.expectEqualStrings("name LIKE 'Eug%'", w);
 }
@@ -824,8 +824,8 @@ test "betweenDates" {
     const w = try betweenDates(
         testing.allocator,
         "sms.created_at",
-        "2026-03-01 00:00:00",
-        "2026-04-01 00:00:00",
+        "'2026-03-01 00:00:00'",
+        "'2026-04-01 00:00:00'",
     );
     defer testing.allocator.free(w);
     try testing.expectEqualStrings(
@@ -1011,7 +1011,7 @@ test "sms aggregation query" {
         },
         .where = try all(a, &.{
             "account_id = '74'",
-            try betweenDates(a, "sms.created_at", "2026-03-01 00:00:00", "2026-04-01 00:00:00"),
+            try betweenDates(a, "sms.created_at", "'2026-03-01 00:00:00'", "'2026-04-01 00:00:00'"),
         }),
         .group = &.{"retry_count"},
     });
