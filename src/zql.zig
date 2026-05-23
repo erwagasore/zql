@@ -171,6 +171,15 @@ test "select with limit and offset" {
     try testing.expectEqualStrings("SELECT * FROM users LIMIT 10 OFFSET 20", sql);
 }
 
+test "select offset without limit" {
+    const sql = try select(testing.allocator, .{
+        .table  = "users",
+        .offset = 100,
+    });
+    defer testing.allocator.free(sql);
+    try testing.expectEqualStrings("SELECT * FROM users OFFSET 100", sql);
+}
+
 test "select with order by" {
     const sql = try select(testing.allocator, .{
         .table = "users",
@@ -196,6 +205,16 @@ test "select distinct" {
     try testing.expectEqualStrings("SELECT DISTINCT country FROM users", sql);
 }
 
+test "select distinct multiple columns" {
+    const sql = try select(testing.allocator, .{
+        .table    = "users",
+        .cols     = &.{ "country", "city" },
+        .distinct = true,
+    });
+    defer testing.allocator.free(sql);
+    try testing.expectEqualStrings("SELECT DISTINCT country, city FROM users", sql);
+}
+
 test "select with join" {
     const sql = try select(testing.allocator, .{
         .table = "users",
@@ -207,6 +226,26 @@ test "select with join" {
     try testing.expectEqualStrings(
         "SELECT users.id, orders.total FROM users " ++
         "INNER JOIN orders ON orders.user_id = users.id " ++
+        "WHERE users.active = 1",
+        sql,
+    );
+}
+
+test "select with multiple joins" {
+    const sql = try select(testing.allocator, .{
+        .table = "users",
+        .cols  = &.{ "users.id", "orders.total", "items.name" },
+        .joins  = &.{
+            "INNER JOIN orders ON orders.user_id = users.id",
+            "LEFT JOIN items ON items.order_id = orders.id",
+        },
+        .where = "users.active = 1",
+    });
+    defer testing.allocator.free(sql);
+    try testing.expectEqualStrings(
+        "SELECT users.id, orders.total, items.name FROM users " ++
+        "INNER JOIN orders ON orders.user_id = users.id " ++
+        "LEFT JOIN items ON items.order_id = orders.id " ++
         "WHERE users.active = 1",
         sql,
     );
@@ -371,6 +410,23 @@ test "insert many missing required fields return errors" {
         .table = "users",
         .rows  = &.{&.{"?"}},
     }));
+}
+
+test "writeInsertMany via fixed buffer" {
+    var buf: [256]u8 = undefined;
+    var w: Writer = .fixed(&buf);
+    try writeInsertMany(&w, .{
+        .table = "users",
+        .cols  = &.{ "name", "email" },
+        .rows  = &.{
+            &.{ "'Eugene'", "'eugene@pindo.io'" },
+            &.{ "'Alice'",  "'alice@example.com'" },
+        },
+    });
+    try testing.expectEqualStrings(
+        "INSERT INTO users (name, email) VALUES ('Eugene', 'eugene@pindo.io'), ('Alice', 'alice@example.com')",
+        w.buffered(),
+    );
 }
 
 // ── UPDATE ────────────────────────────────────────────────────────────────────
@@ -1077,4 +1133,22 @@ test "writeSelect via fixed buffer" {
     var w: Writer = .fixed(&buf);
     try writeSelect(&w, .{ .table = "users", .where = "active = 1" });
     try testing.expectEqualStrings("SELECT * FROM users WHERE active = 1", w.buffered());
+}
+
+test "writeUpdate via fixed buffer" {
+    var buf: [128]u8 = undefined;
+    var w: Writer = .fixed(&buf);
+    try writeUpdate(&w, .{
+        .table = "users",
+        .set   = &.{"active = 0"},
+        .where = "id = 1",
+    });
+    try testing.expectEqualStrings("UPDATE users SET active = 0 WHERE id = 1", w.buffered());
+}
+
+test "writeDelete via fixed buffer" {
+    var buf: [128]u8 = undefined;
+    var w: Writer = .fixed(&buf);
+    try writeDelete(&w, .{ .table = "users", .where = "id = 1" });
+    try testing.expectEqualStrings("DELETE FROM users WHERE id = 1", w.buffered());
 }
