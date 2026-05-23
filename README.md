@@ -234,8 +234,33 @@ allocators, where intermediate reallocs would otherwise stay resident until
 
 The caller owns the result and must free it with the same allocator.
 
+### Compositions and intermediate allocations
+
+When you build a complex `WHERE` clause from multiple helpers, each helper
+returns its own allocated fragment:
+
 ```zig
-// GPA — explicit defer
+const c1 = try zql.eq(a, "active", "1");     // alloc 1
+const c2 = try zql.between(a, "age", "18", "65"); // alloc 2
+const w  = try zql.all(a, &.{ c1, c2 });     // alloc 3
+const sql = try zql.select(a, .{ .where = w });  // alloc 4
+```
+
+With a GPA each fragment needs its own `defer free`. For multi-fragment
+queries an arena is the practical choice — one `deinit` cleans up everything.
+
+```zig
+// GPA — explicit defer for every fragment
+const c1 = try zql.eq(allocator, "active", "1");
+defer allocator.free(c1);
+const w = try zql.all(allocator, &.{c1});
+defer allocator.free(w);
+const sql = try zql.select(allocator, .{ .where = w });
+defer allocator.free(sql);
+```
+
+```zig
+// GPA — explicit defer for the statement only
 const sql = try zql.select(allocator, .{ .table = "users" });
 defer allocator.free(sql);
 ```
