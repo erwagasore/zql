@@ -10,13 +10,13 @@ Tick the task only after its branch is merged back to `main`.
 
 ## Tasks
 
-- [ ] **docs(memory): document arena allocator pattern for compositions**
+- [x] **docs(memory): document arena allocator pattern for compositions**
 
   Add a README section explaining that complex WHERE compositions create intermediate allocations per helper call, and that `std.heap.ArenaAllocator` is the recommended pattern for batching them. Anchor this to `SPEC.md:149` for the memory contract and `SPEC.md:159` for documentation requirements.
 
   *Done when:* README includes an explicit arena example for multi-fragment WHERE composition and `zig build test` passes.
 
-- [ ] **refactor(helpers): remove automatic quoting from `like` and `betweenDates`**
+- [x] **refactor(helpers): remove automatic quoting from `like` and `betweenDates`**
 
   Make all helpers consistent: none quote values. `like` and `betweenDates` currently wrap args in `'`, but `eq`, `between`, `coalesce`, etc. do not. Remove the automatic quoting so callers always control literal formatting. Update inline tests, README examples, and SPEC API surface table accordingly. Anchor this to `SPEC.md:20` for API surface and `SPEC.md:115` for safety boundaries.
 
