@@ -69,6 +69,7 @@ Two variants per function: bare and aliased (`*As`).
 |---|---|
 | `sum(col)` | `sumAs(col, alias)` |
 | `count(col)` | `countAs(col, alias)` |
+| `countDistinct(col)` | `countDistinctAs(col, alias)` |
 | `avg(col)` | `avgAs(col, alias)` |
 | `min(col)` | `minAs(col, alias)` |
 | `max(col)` | `maxAs(col, alias)` |

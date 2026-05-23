@@ -693,6 +693,8 @@ try zql.sumAs(a, "amount", "total")               // → "SUM(amount) AS total"
 
 try zql.count(a, "*")                             // → "COUNT(*)"
 try zql.countAs(a, "*", "total")                  // → "COUNT(*) AS total"
+try zql.countDistinct(a, "country")               // → "COUNT(DISTINCT country)"
+try zql.countDistinctAs(a, "country", "n_countries") // → "COUNT(DISTINCT country) AS n_countries"
 
 try zql.avg(a, "price")                           // → "AVG(price)"
 try zql.avgAs(a, "price", "avg_price")            // → "AVG(price) AS avg_price"

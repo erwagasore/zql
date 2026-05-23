@@ -872,6 +872,14 @@ pub fn countAs(gpa: Allocator, col: []const u8, alias: []const u8) ![]u8 {
     return std.fmt.allocPrint(gpa, "COUNT({s}) AS {s}", .{ col, alias });
 }
 
+pub fn countDistinct(gpa: Allocator, col: []const u8) ![]u8 {
+    return std.fmt.allocPrint(gpa, "COUNT(DISTINCT {s})", .{col});
+}
+
+pub fn countDistinctAs(gpa: Allocator, col: []const u8, alias: []const u8) ![]u8 {
+    return std.fmt.allocPrint(gpa, "COUNT(DISTINCT {s}) AS {s}", .{ col, alias });
+}
+
 pub fn avg(gpa: Allocator, col: []const u8) ![]u8 {
     return std.fmt.allocPrint(gpa, "AVG({s})", .{col});
 }
@@ -964,6 +972,18 @@ test "countAs" {
     const s = try countAs(testing.allocator, "*", "total");
     defer testing.allocator.free(s);
     try testing.expectEqualStrings("COUNT(*) AS total", s);
+}
+
+test "countDistinct" {
+    const s = try countDistinct(testing.allocator, "country");
+    defer testing.allocator.free(s);
+    try testing.expectEqualStrings("COUNT(DISTINCT country)", s);
+}
+
+test "countDistinctAs" {
+    const s = try countDistinctAs(testing.allocator, "country", "n_countries");
+    defer testing.allocator.free(s);
+    try testing.expectEqualStrings("COUNT(DISTINCT country) AS n_countries", s);
 }
 
 test "avgAs" {
